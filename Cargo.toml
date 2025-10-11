@@ -1,0 +1,16 @@
+[package]
+name = "portable-io"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+unsafe-assume-single-core = ["portable-atomic/unsafe-assume-single-core"]
+critical-section = ["portable-atomic/critical-section", "maitake-sync/critical-section"]
+
+[dependencies]
+embedded-io-async = "0.7.0"
+maitake-sync = { version = "0.2.2", default-features = false, features = ["no-cache-pad"] }
+portable-atomic = "1.11.1"
+
+[dev-dependencies]
+futures-executor = { version = "0.3.31", features = ["thread-pool"] }
