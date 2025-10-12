@@ -1,14 +1,11 @@
-#![no_std]
+// #![no_std]
 
 use core::cell::UnsafeCell;
-use portable_atomic::AtomicBool;
 use maitake_sync::WaitCell;
-
-mod grant;
-pub use grant::{GrantReader, GrantWriter};
+use portable_atomic::AtomicBool;
 
 mod dev;
-pub use dev::{DevProducer, DevConsumer};
+pub use dev::{DevConsumer, DevProducer};
 
 mod app;
 pub use app::{AppConsumer, AppProducer};
@@ -19,17 +16,17 @@ use buffer::{AtomicBuffer, Consumer, Producer};
 mod error;
 use error::AtomicError;
 
-struct SerialState<E> {
-    pub(crate) buffer: AtomicBuffer,
+struct State<E> {
+    pub(crate) atomic: AtomicBuffer,
     pub(crate) error: AtomicError<E>,
     pub(crate) wait_writer: WaitCell,
     pub(crate) wait_reader: WaitCell,
 }
 
-impl<E> SerialState<E> {
+impl<E> State<E> {
     const fn new() -> Self {
         Self {
-            buffer: AtomicBuffer::new(),
+            atomic: AtomicBuffer::new(),
             error: AtomicError::new(),
             wait_writer: WaitCell::new(),
             wait_reader: WaitCell::new(),
@@ -38,21 +35,21 @@ impl<E> SerialState<E> {
 }
 
 /// A structure that owns the shared state and the buffer for serial communication.
-pub struct SerialPort<const N: usize, E> {
-    state: SerialState<E>,
+pub struct AtomicIo<const N: usize, E> {
+    state: State<E>,
     buffer: UnsafeCell<[u8; N]>,
     initialized: AtomicBool,
 }
 
-unsafe impl<const N: usize, E> Send for SerialPort<N, E> {}
-unsafe impl<const N: usize, E> Sync for SerialPort<N, E> {}
+unsafe impl<const N: usize, E> Send for AtomicIo<N, E> {}
+unsafe impl<const N: usize, E> Sync for AtomicIo<N, E> {}
 
-impl<const N: usize, E> SerialPort<N, E> {
+impl<const N: usize, E> AtomicIo<N, E> {
     /// Creates a new, uninitialized SerialPort.
     pub const fn new() -> Self {
-        assert!(N > 0, "The value of `N` must be non-zero");        
+        assert!(N > 0, "The value of `N` must be non-zero");
         Self {
-            state: SerialState::new(),
+            state: State::new(),
             buffer: UnsafeCell::new([0; N]),
             initialized: AtomicBool::new(false),
         }
@@ -70,7 +67,7 @@ impl<const N: usize, E> SerialPort<N, E> {
         // buffer once, and use it with this particular buffer state.
         let buffer = unsafe { &mut *self.buffer.get() };
 
-        self.state.buffer.init(buffer)
+        self.state.atomic.init(buffer)
     }
 
     #[track_caller]
@@ -112,6 +109,7 @@ impl<const N: usize, E> SerialPort<N, E> {
             AppProducer {
                 producer,
                 state: &self.state,
+                grant: None,
             },
         ))
     }

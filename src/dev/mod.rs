@@ -1,48 +1,26 @@
 use super::buffer::{Consumer, Producer};
 use embedded_io_async::{ErrorType, Read, Write};
+use maitake_sync::WaitCell;
 
-use super::{
-    SerialState,
-    grant::{GrantReader, GrantWriter},
-};
+use super::State;
 
 pub struct DevProducer<'a, E> {
     pub(super) producer: Producer<'a>,
-    pub(super) state: &'a SerialState<E>,
+    pub(super) state: &'a State<E>,
 }
 
-impl<E> DevProducer<'_, E> {
-    pub async fn grant_writer(&mut self) -> GrantWriter<'_, E> {
-        loop {
-            let subscribtion = self.state.wait_writer.subscribe().await;
-
-            match self.producer.get_grant() {
-                Ok(grant_inner) => {
-                    return GrantWriter {
-                        state: self.state,
-                        inner: grant_inner,
-                    };
-                }
-
-                Err(super::buffer::Error::GrantInProgress) => {
-                    panic!("Double-grants are illegal!");
-                }
-
-                Err(super::buffer::Error::InsufficientSize) => {
-                    let res = subscribtion.await;
-                    debug_assert!(res.is_ok());
-                }
-            }
-        }
+impl<'a, E> DevProducer<'a, E> {
+    pub async fn write(&mut self, buf: &[u8]) -> usize {
+        let mut grant = self.get_writer_grant().await;
+        let bytes = grant.copy_max_from(buf);
+        grant.commit(bytes);
+        self.state.wait_reader.wake();
+        bytes
     }
 
     pub fn insert_error(&mut self, error: E) {
         self.state.error.set(error);
         self.state.wait_reader.wake();
-    }
-
-    pub async fn write(&mut self, buf: &[u8]) -> usize {
-        self.grant_writer().await.copy_max_from(buf)
     }
 
     /// Connect this writer to another [`embedded_io_async::Read`], such that
@@ -52,51 +30,42 @@ impl<E> DevProducer<'_, E> {
     /// represented by a 0 byte read.
     pub async fn connect<R: Read<Error = E>>(&mut self, mut reader: R) {
         loop {
-            let mut grant = self.grant_writer().await;
-            match reader.read(grant.buffer_mut()).await {
-                Ok(0) => break, // This should not happen
-                Ok(bytes) => grant.commit(bytes),
+            let mut grant = self.get_writer_grant().await;
+            match reader.read(grant.buf_mut()).await {
+                Ok(0) => break,
+                Ok(bytes) => {
+                    grant.commit(bytes);
+                    self.state.wait_reader.wake();
+                }
                 Err(error) => {
-                    drop(grant); // Drop without waking
+                    grant.commit(0);
                     self.insert_error(error);
+                    self.state.wait_reader.wake();
                 }
             }
+        }
+    }
+
+    fn get_writer_grant(&mut self) -> WriterGrantFuture<'_, 'a> {
+        WriterGrantFuture {
+            wait: &self.state.wait_writer,
+            producer: &mut self.producer,
         }
     }
 }
 
 pub struct DevConsumer<'a, E> {
     pub(super) consumer: Consumer<'a>,
-    pub(super) state: &'a SerialState<E>,
+    pub(super) state: &'a State<E>,
 }
 
-impl<E> DevConsumer<'_, E> {
-    pub async fn grant_reader(&mut self) -> GrantReader<'_, E> {
-        loop {
-            let subscribtion = self.state.wait_reader.subscribe().await;
-
-            match self.consumer.get_grant() {
-                Ok(grant_inner) => {
-                    return GrantReader {
-                        state: self.state,
-                        inner: grant_inner,
-                    };
-                }
-
-                Err(super::buffer::Error::GrantInProgress) => {
-                    panic!("Double-grants are illegal!");
-                }
-
-                Err(super::buffer::Error::InsufficientSize) => {
-                    let res = subscribtion.await;
-                    debug_assert!(res.is_ok());
-                }
-            }
-        }
-    }
-
+impl<'a, E> DevConsumer<'a, E> {
     pub async fn read(&mut self, buf: &mut [u8]) -> usize {
-        self.grant_reader().await.copy_max_into(buf)
+        let mut grant = self.get_reader_grant().await;
+        let bytes = grant.copy_max_into(buf);
+        grant.release(bytes);
+        self.state.wait_writer.wake();
+        bytes
     }
 
     pub fn insert_error(&mut self, error: E) {
@@ -110,15 +79,73 @@ impl<E> DevConsumer<'_, E> {
     /// This will loop forever, *or* until the `writer` reaches an EOF condition.
     pub async fn connect<W: Write<Error = E>>(&mut self, mut writer: W) {
         loop {
-            let grant = self.grant_reader().await;
+            let grant = self.get_reader_grant().await;
 
-            match writer.write(grant.buffer()).await {
+            match writer.write(grant.buf()).await {
                 Ok(0) => break,
-                Ok(bytes) => grant.release(bytes),
-                Err(error) => {
-                    drop(grant); // Drop without waking
-                    self.insert_error(error)
+                Ok(bytes) => {
+                    grant.release(bytes);
+                    self.state.wait_writer.wake();
                 }
+                Err(error) => {
+                    grant.release(0);
+                    self.insert_error(error);
+                    self.state.wait_writer.wake();
+                }
+            }
+        }
+    }
+
+    fn get_reader_grant(&mut self) -> ReaderGrantFuture<'_, 'a> {
+        ReaderGrantFuture {
+            wait: &self.state.wait_reader,
+            consumer: &mut self.consumer,
+        }
+    }
+}
+
+pub struct WriterGrantFuture<'s, 'a> {
+    pub(crate) wait: &'a WaitCell,
+    pub(crate) producer: &'s mut Producer<'a>,
+}
+
+pub struct ReaderGrantFuture<'s, 'a> {
+    pub(crate) wait: &'a WaitCell,
+    pub(crate) consumer: &'s mut Consumer<'a>,
+}
+
+mod impl_futures {
+    use crate::{
+        buffer::{ReaderGrant, WriterGrant},
+        dev::{ReaderGrantFuture, WriterGrantFuture},
+    };
+    use core::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    impl<'s, 'a> Future for WriterGrantFuture<'s, 'a> {
+        type Output = WriterGrant<'a>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            _ = self.wait.poll_wait(cx);
+
+            match self.producer.get_grant() {
+                Some(grant) => Poll::Ready(grant),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl<'s, 'a> Future for ReaderGrantFuture<'s, 'a> {
+        type Output = ReaderGrant<'a>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            _ = self.wait.poll_wait(cx);
+
+            match self.consumer.get_grant() {
+                Some(grant) => Poll::Ready(grant),
+                None => Poll::Pending,
             }
         }
     }

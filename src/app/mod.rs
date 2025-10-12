@@ -1,46 +1,24 @@
-use super::buffer::{Consumer, GrantR, Producer};
+use crate::buffer::WriterGrant;
 
-use super::{SerialState, grant::GrantWriter};
+use super::buffer::{Consumer, Producer, ReaderGrant};
+
+use super::State;
 
 pub struct AppProducer<'a, E> {
     pub(super) producer: Producer<'a>,
-    pub(super) state: &'a SerialState<E>,
+    pub(super) state: &'a State<E>,
+    pub(super) grant: Option<WriterGrant<'a>>,
 }
 
-impl<E> AppProducer<'_, E> {
-    pub async fn grant_writer(&mut self) -> Result<GrantWriter<'_, E>, E> {
-        loop {
-            let subscription = self.state.wait_writer.subscribe().await;
-
-            if let Some(error) = self.state.error.take() {
-                return Err(error);
-            }
-
-            match self.producer.get_grant() {
-                Ok(grant_inner) => {
-                    return Ok(GrantWriter {
-                        state: self.state,
-                        inner: grant_inner,
-                    });
-                }
-
-                Err(super::buffer::Error::GrantInProgress) => {
-                    panic!("Double-grants are illegal!");
-                }
-
-                // No bytes available to read, wait for subscription
-                Err(super::buffer::Error::InsufficientSize) => {
-                    let res = subscription.await;
-                    debug_assert!(res.is_ok());
-                }
-            }
-        }
+impl<'a, E> AppProducer<'a, E> {
+    pub async fn write(&mut self, buf: &[u8]) -> Result<usize, E> {
+        let bytes = self.grant_writer().await?.copy_max_from(buf);
+        self.commit(bytes);
+        Ok(bytes)
     }
 
-    pub async fn write(&mut self, buf: &[u8]) -> Result<usize, E> {
-        self.grant_writer()
-            .await
-            .map(|grant| grant.copy_max_from(buf))
+    pub async fn buf_mut(&mut self) -> Result<&mut [u8], E> {
+        Ok(self.grant_writer().await?.buf_mut())
     }
 
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), E> {
@@ -54,49 +32,90 @@ impl<E> AppProducer<'_, E> {
         }
         Ok(())
     }
-}
 
-pub struct AppConsumer<'a, E> {
-    pub(super) consumer: Consumer<'a>,
-    pub(super) state: &'a SerialState<E>,
-    pub(super) grant: Option<GrantR<'a>>,
-}
+    pub fn commit(&mut self, bytes: usize) {
+        if let Some(grant) = self.grant.take() {
+            grant.commit(bytes);
+        }
+        self.state.wait_reader.wake();
+    }
 
-impl<'a, E> AppConsumer<'a, E> {
-    async fn get_grant(&mut self) -> Result<&mut GrantR<'a>, E> {
+    async fn grant_writer(&mut self) -> Result<&mut WriterGrant<'a>, E> {
+        if let Some(error) = self.state.error.take() {
+            return Err(error);
+        }
+
+        if self.grant.is_some() {
+            return Ok(self.grant.as_mut().unwrap());
+        }
+
         loop {
-            let subscription = self.state.wait_reader.subscribe().await;
+            let subscription = self.state.wait_writer.subscribe().await;
+
+            if let Some(grant) = self.producer.get_grant() {
+                return Ok(self.grant.insert(grant));
+            }
+
+            let res = subscription.await;
+            debug_assert!(res.is_ok());
 
             if let Some(error) = self.state.error.take() {
                 return Err(error);
             }
-
-            // Release any existing grant, double-grants are illegal anyway
-            self.grant = None;
-
-            match self.consumer.get_grant() {
-                Ok(g) => return Ok(self.grant.insert(g)),
-                _ => _ = subscription.await,
-            }
         }
     }
+}
 
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, E> {
-        let available = self.fill_buf().await?;
-        let bytes = buf.len().min(available.len());
-        buf[..bytes].copy_from_slice(&available[..bytes]);
-        self.consume(bytes);
+pub struct AppConsumer<'a, E> {
+    pub(super) consumer: Consumer<'a>,
+    pub(super) state: &'a State<E>,
+    pub(super) grant: Option<ReaderGrant<'a>>,
+}
 
+impl<'a, E> AppConsumer<'a, E> {
+    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, E> {
+        let bytes = self.get_grant().await?.copy_max_into(buf);
+        self.release(bytes);
         Ok(bytes)
     }
 
-    async fn fill_buf(&mut self) -> Result<&[u8], E> {
+    pub async fn fill_buf(&mut self) -> Result<&[u8], E> {
         self.get_grant().await.map(|grant| grant.buf())
     }
 
-    fn consume(&mut self, amt: usize) {
+    pub async fn fill_buf_mut(&mut self) -> Result<&mut [u8], E> {
+        self.get_grant().await.map(|grant| grant.buf_mut())
+    }
+
+    pub fn release(&mut self, bytes: usize) {
         if let Some(grant) = self.grant.take() {
-            grant.release(amt);
+            grant.release(bytes);
+        }
+        self.state.wait_writer.wake();
+    }
+
+    async fn get_grant(&mut self) -> Result<&mut ReaderGrant<'a>, E> {
+        if let Some(error) = self.state.error.take() {
+            return Err(error);
+        }
+
+        if self.grant.is_some() {
+            return Ok(self.grant.as_mut().unwrap());
+        }
+
+        loop {
+            let subscription = self.state.wait_reader.subscribe().await;
+
+            if let Some(grant) = self.consumer.get_grant() {
+                return Ok(self.grant.insert(grant));
+            }
+
+            let res = subscription.await;
+            debug_assert!(res.is_ok());
+
+            if let Some(error) = self.state.error.take() {
+                return Err(error);
+            }
         }
     }
 }
@@ -137,8 +156,8 @@ mod impl_embedded_io_async {
             AppConsumer::fill_buf(self).await
         }
 
-        fn consume(&mut self, amt: usize) {
-            AppConsumer::consume(self, amt)
+        fn consume(&mut self, bytes: usize) {
+            AppConsumer::release(self, bytes)
         }
     }
 }
@@ -147,13 +166,13 @@ mod test {
 
     #[test]
     fn test_buf_read() {
-        use crate::SerialPort;
-        use embedded_io_async::Write;
+        use crate::AtomicIo;
         use core::convert::Infallible;
+        use embedded_io_async::Write;
 
         const BUF: &[u8] = b"_foo_bar_baz";
 
-        let serial_port = SerialPort::<20, Infallible>::new();
+        let serial_port = AtomicIo::<20, Infallible>::new();
         let (mut hard, mut soft) = serial_port.claim_reader();
 
         futures_executor::block_on(async {
