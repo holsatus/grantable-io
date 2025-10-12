@@ -6,18 +6,17 @@ use super::{
     grant::{GrantReader, GrantWriter},
 };
 
-pub struct HardWriter<'a> {
+pub struct DevProducer<'a, E> {
     pub(super) producer: Producer<'a>,
-    pub(super) state: &'a SerialState,
+    pub(super) state: &'a SerialState<E>,
 }
 
-impl HardWriter<'_> {
-    pub async fn grant_writer(&mut self) -> GrantWriter<'_> {
+impl<E> DevProducer<'_, E> {
+    pub async fn grant_writer(&mut self) -> GrantWriter<'_, E> {
         loop {
             let subscribtion = self.state.wait_writer.subscribe().await;
-            // use core::sync::atomic::{compiler_fence, Ordering};
-            // compiler_fence(Ordering::AcqRel);
-            match self.producer.grant_max_remaining() {
+
+            match self.producer.get_grant() {
                 Ok(grant_inner) => {
                     return GrantWriter {
                         state: self.state,
@@ -37,8 +36,8 @@ impl HardWriter<'_> {
         }
     }
 
-    pub fn insert_error(&mut self, error: impl embedded_io_async::Error) {
-        self.state.error.set(error.kind());
+    pub fn insert_error(&mut self, error: E) {
+        self.state.error.set(error);
         self.state.wait_reader.wake();
     }
 
@@ -51,32 +50,32 @@ impl HardWriter<'_> {
     ///
     /// This will loop forever, or until the reader returns an EOF conditions,
     /// represented by a 0 byte read.
-    pub async fn connect<R: Read>(&mut self, mut reader: R) {
+    pub async fn connect<R: Read<Error = E>>(&mut self, mut reader: R) {
         loop {
             let mut grant = self.grant_writer().await;
             match reader.read(grant.buffer_mut()).await {
                 Ok(0) => break, // This should not happen
                 Ok(bytes) => grant.commit(bytes),
                 Err(error) => {
-                    drop(grant);
-                    self.insert_error(error)
+                    drop(grant); // Drop without waking
+                    self.insert_error(error);
                 }
             }
         }
     }
 }
 
-pub struct HardReader<'a> {
+pub struct DevConsumer<'a, E> {
     pub(super) consumer: Consumer<'a>,
-    pub(super) state: &'a SerialState,
+    pub(super) state: &'a SerialState<E>,
 }
 
-impl HardReader<'_> {
-    pub async fn grant_reader(&mut self) -> GrantReader<'_> {
+impl<E> DevConsumer<'_, E> {
+    pub async fn grant_reader(&mut self) -> GrantReader<'_, E> {
         loop {
             let subscribtion = self.state.wait_reader.subscribe().await;
 
-            match self.consumer.read() {
+            match self.consumer.get_grant() {
                 Ok(grant_inner) => {
                     return GrantReader {
                         state: self.state,
@@ -100,26 +99,16 @@ impl HardReader<'_> {
         self.grant_reader().await.copy_max_into(buf)
     }
 
-    pub fn insert_error(&mut self, error: impl embedded_io_async::Error) {
-        self.state.error.set(error.kind());
+    pub fn insert_error(&mut self, error: E) {
+        self.state.error.set(error);
         self.state.wait_writer.wake();
-    }
-
-    pub async fn read_exact(&mut self, buf: &mut [u8]) {
-        let res = Read::read_exact(self, buf).await;
-
-        // Even though our implementation is infallible, read_exact *could* encounter
-        // an EOF conditions, if the number of bytes received is 0. This should never
-        // happen, since bbqueue should never give us an empty grant. Use debug assert
-        // here to catch any regression.
-        debug_assert!(res.is_ok());
     }
 
     /// Connect this reader to another [`embedded_io_async::Write`], such that
     /// all bytes received through this reader will be written to `writer`.
     ///
     /// This will loop forever, *or* until the `writer` reaches an EOF condition.
-    pub async fn connect<W: Write>(&mut self, mut writer: W) {
+    pub async fn connect<W: Write<Error = E>>(&mut self, mut writer: W) {
         loop {
             let grant = self.grant_reader().await;
 
@@ -127,7 +116,7 @@ impl HardReader<'_> {
                 Ok(0) => break,
                 Ok(bytes) => grant.release(bytes),
                 Err(error) => {
-                    drop(grant);
+                    drop(grant); // Drop without waking
                     self.insert_error(error)
                 }
             }
@@ -137,13 +126,13 @@ impl HardReader<'_> {
 
 // ---- embedded-io-async impls ---- //
 
-impl ErrorType for HardReader<'_> {
+impl<E> ErrorType for DevConsumer<'_, E> {
     type Error = core::convert::Infallible;
 }
 
-impl Write for HardWriter<'_> {
+impl<E> Write for DevProducer<'_, E> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        Ok(HardWriter::write(self, buf).await)
+        Ok(DevProducer::write(self, buf).await)
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
@@ -151,12 +140,12 @@ impl Write for HardWriter<'_> {
     }
 }
 
-impl ErrorType for HardWriter<'_> {
+impl<E> ErrorType for DevProducer<'_, E> {
     type Error = core::convert::Infallible;
 }
 
-impl Read for HardReader<'_> {
+impl<E> Read for DevConsumer<'_, E> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        Ok(HardReader::read(self, buf).await)
+        Ok(DevConsumer::read(self, buf).await)
     }
 }

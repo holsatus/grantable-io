@@ -4,12 +4,12 @@ use super::SerialState;
 
 /// Thin wrapper around a [`bbqueue::GrantR`] that also holds a reference
 /// to a waker to alert the writer-half of the bytes consumed.
-pub struct GrantWriter<'a> {
-    pub(crate) state: &'a SerialState,
+pub struct GrantWriter<'a, E> {
+    pub(crate) state: &'a SerialState<E>,
     pub(crate) inner: GrantW<'a>,
 }
 
-impl GrantWriter<'_> {
+impl<E> GrantWriter<'_, E> {
     /// Copy the largest possible amount of bytes to the grant
     /// from the given buffer. Whichever is shorter decides the number
     /// of bytes written. The return value is the amount copied.
@@ -42,12 +42,12 @@ impl GrantWriter<'_> {
 
 /// Thin wrapper around a [`bbqueue::GrantR`] that also holds a reference
 /// to a waker to alert the writer-half of the bytes consumed.
-pub struct GrantReader<'a> {
-    pub(crate) state: &'a SerialState,
+pub struct GrantReader<'a, E> {
+    pub(crate) state: &'a SerialState<E>,
     pub(crate) inner: GrantR<'a>,
 }
 
-impl GrantReader<'_> {
+impl<E> GrantReader<'_, E> {
     /// Copy the largest possible amount of bytes from the grant
     /// to the given buffer. Whichever is shorter decides the number
     /// of bytes written. The return value is the amount copied.
@@ -59,10 +59,7 @@ impl GrantReader<'_> {
         buf[..amount].copy_from_slice(&self.inner.buf()[..amount]);
 
         // Release the copied amount on drop
-        self.inner.release(amount);
-
-        // Wake any waiting writer
-        self.state.wait_writer.wake();
+        self.release(amount);
 
         // The number copied
         amount

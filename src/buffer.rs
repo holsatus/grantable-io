@@ -28,7 +28,7 @@ pub enum Error {
 #[derive(Debug)]
 /// A backing structure for a BBQueue. Can be used to create either
 /// a BBQueue or a split Producer/Consumer pair
-pub struct BufferState {
+pub struct AtomicBuffer {
     initialized: AtomicBool,
 
     /// Where the next byte will be written
@@ -57,13 +57,13 @@ pub struct BufferState {
     write_in_progress: AtomicBool,
 }
 
-impl Default for BufferState {
+impl Default for AtomicBuffer {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl BufferState {
+impl AtomicBuffer {
     /// Create a new constant inner portion of a `BBBuffer`.
     ///
     /// NOTE: This is only necessary to use when creating a `BBBuffer` at static
@@ -121,18 +121,30 @@ impl BufferState {
             return None;
         }
 
-        Some((
+        // SAFETY: We just checked above that it was not already initialized
+        Some(unsafe { self.init_unchecked(buf) })
+    }
+
+    /// Initialize this [`AtomicBuffer`] with the provided mutable slice.
+    /// 
+    /// # Safety
+    /// 
+    /// This must never be called on a buffer that has already been initialized.
+    /// If [`AtomicBuffer::can_init_safely`] returns `false`, do *not* call this
+    /// function.
+    unsafe fn init_unchecked(&self, buf: &mut [u8]) -> (Producer<'_>, Consumer<'_>) {
+        (
             Producer {
                 buf: NonNull::from(&*buf),
                 state: NonNull::from(self),
-                pd: PhantomData,
+                lifetime: PhantomData,
             },
             Consumer {
                 buf: NonNull::from(&*buf),
                 state: NonNull::from(self),
-                pd: PhantomData,
+                lifetime: PhantomData,
             },
-        ))
+        )
     }
 }
 
@@ -163,85 +175,20 @@ impl BufferState {
 #[derive(Debug)]
 pub struct Producer<'a> {
     buf: NonNull<[u8]>,
-    pub(crate) state: NonNull<BufferState>,
-    pd: PhantomData<&'a ()>,
+    state: NonNull<AtomicBuffer>,
+    lifetime: PhantomData<&'a ()>,
 }
 
 unsafe impl Send for Producer<'_> {}
 
 impl<'a> Producer<'a> {
-    /// Request a writable, contiguous section of memory of exactly
-    /// `sz` bytes. If the buffer size requested is not available,
-    /// an error will be returned.
-    ///
-    /// This method may cause the buffer to wrap around early if the
-    /// requested space is not available at the end of the buffer, but
-    /// is available at the beginning
-    pub fn grant_exact(&mut self, sz: usize) -> Result<GrantW<'a>> {
-        let inner = unsafe { &self.state.as_ref() };
-
-        if inner.write_in_progress.swap(true, AcqRel) {
-            return Err(Error::GrantInProgress);
-        }
-
-        // Writer component. Must never write to `read`,
-        // be careful writing to `load`
-        let write = inner.write.load(Acquire);
-        let read = inner.read.load(Acquire);
-        let already_inverted = write < read;
-
-        let start = if already_inverted {
-            if (write + sz) < read {
-                // Inverted, room is still available
-                write
-            } else {
-                // Inverted, no room is available
-                inner.write_in_progress.store(false, Release);
-                return Err(Error::InsufficientSize);
-            }
-        } else {
-            #[allow(clippy::collapsible_if)]
-            if write + sz <= self.buf.len() {
-                // Non inverted condition
-                write
-            } else {
-                // Not inverted, but need to go inverted
-
-                // NOTE: We check sz < read, NOT <=, because
-                // write must never == read in an inverted condition, since
-                // we will then not be able to tell if we are inverted or not
-                if sz < read {
-                    // Invertible situation
-                    0
-                } else {
-                    // Not invertible, no space
-                    inner.write_in_progress.store(false, Release);
-                    return Err(Error::InsufficientSize);
-                }
-            }
-        };
-
-        // Safe write, only viewed by this task
-        inner.reserve.store(start + sz, Release);
-
-        // This is sound, as UnsafeCell, MaybeUninit, and GenericArray
-        // are all `#[repr(Transparent)]
-        let grant_slice = unsafe { &self.buf.as_mut()[start..(start + sz)] };
-
-        Ok(GrantW {
-            buf: grant_slice.into(),
-            bbq: self.state,
-            phatom: PhantomData,
-        })
-    }
-
     /// Request a writable, contiguous section of memory of up to
     /// `sz` bytes. If a buffer of size `sz` is not available without
     /// wrapping, but some space (0 < available < sz) is available without
     /// wrapping, then a grant will be given for the remaining size at the
     /// end of the buffer. If no space is available for writing, an error
     /// will be returned.
-    pub fn grant_max_remaining(&mut self) -> Result<GrantW<'a>> {
+    pub fn get_grant(&mut self) -> Result<GrantW<'a>> {
         let inner = unsafe { &self.state.as_ref() };
 
         if inner.write_in_progress.swap(true, AcqRel) {
@@ -311,8 +258,8 @@ impl<'a> Producer<'a> {
 #[derive(Debug)]
 pub struct Consumer<'a> {
     buf: NonNull<[u8]>,
-    pub(crate) state: NonNull<BufferState>,
-    pd: PhantomData<&'a ()>,
+    state: NonNull<AtomicBuffer>,
+    lifetime: PhantomData<&'a ()>,
 }
 
 unsafe impl Send for Consumer<'_> {}
@@ -322,7 +269,7 @@ impl<'a> Consumer<'a> {
     /// contain ALL available bytes, if the writer has wrapped around. The
     /// remaining bytes will be available after all readable bytes are
     /// released
-    pub fn read(&mut self) -> Result<GrantR<'a>> {
+    pub fn get_grant(&mut self) -> Result<GrantR<'a>> {
         let inner = unsafe { &self.state.as_ref() };
 
         if inner.read_in_progress.swap(true, AcqRel) {
@@ -385,7 +332,7 @@ impl<'a> Consumer<'a> {
 #[derive(Debug, PartialEq)]
 pub struct GrantW<'a> {
     pub(crate) buf: NonNull<[u8]>,
-    bbq: NonNull<BufferState>,
+    bbq: NonNull<AtomicBuffer>,
     phatom: PhantomData<&'a mut [u8]>,
 }
 
@@ -406,7 +353,7 @@ unsafe impl Send for GrantW<'_> {}
 #[derive(Debug, PartialEq)]
 pub struct GrantR<'a> {
     pub(crate) buf: NonNull<[u8]>,
-    bbq: NonNull<BufferState>,
+    bbq: NonNull<AtomicBuffer>,
     phatom: PhantomData<&'a mut [u8]>,
 }
 
