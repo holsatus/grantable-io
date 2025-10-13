@@ -1,6 +1,6 @@
-use crate::buffer::ProduceGrant;
-use super::buffer::{Consumer, Producer, ConsumeGrant};
 use super::State;
+use super::buffer::{ConsumeGrant, Consumer, Producer};
+use crate::buffer::ProduceGrant;
 
 pub struct AppProducer<'a, E> {
     pub(super) producer: Producer<'a>,
@@ -123,8 +123,8 @@ impl<'a, E> AppConsumer<'a, E> {
 #[cfg(feature = "_any_embedded_io_async")]
 mod impl_embedded_io_async {
 
-    use crate::{AppConsumer, AppProducer};
     use crate::embedded_io_async::{BufRead, Error, ErrorType, Read, Write};
+    use crate::{AppConsumer, AppProducer};
 
     impl<E: Error> ErrorType for AppProducer<'_, E> {
         type Error = E;

@@ -157,7 +157,10 @@ impl<'a> Producer<'a> {
         // This is sound, as `NonNull` is `#[repr(transparent)]
         let grant = unsafe { &mut self.buffer.as_mut()[start..(start + grant)] };
 
-        Some(ProduceGrant { grant, atomic: self.atomic })
+        Some(ProduceGrant {
+            grant,
+            atomic: self.atomic,
+        })
     }
 }
 
@@ -209,7 +212,10 @@ impl<'a> Consumer<'a> {
         // This is sound, as `NonNull` is `#[repr(transparent)]
         let grant = unsafe { &mut self.buffer.as_mut()[read..(read + grant)] };
 
-        Some(ConsumeGrant { grant, atomic: self.atomic })
+        Some(ConsumeGrant {
+            grant,
+            atomic: self.atomic,
+        })
     }
 }
 

@@ -1,6 +1,5 @@
 use super::buffer::{Consumer, Producer};
 
-
 #[cfg(feature = "_any_embedded_io_async")]
 use crate::embedded_io_async::{Read, Write};
 
@@ -46,7 +45,10 @@ impl<'a, E> DevProducer<'a, E> {
     /// This will loop forever, or until the reader returns an EOF conditions,
     /// represented by a 0 byte read.
     #[cfg(feature = "_any_embedded_io_async")]
-    pub async fn embedded_io_connect<R: Read<Error = E>>(&mut self, mut reader: R) {
+    pub async fn embedded_io_connect<R: Read>(&mut self, mut reader: R)
+    where
+        R::Error: Into<E>,
+    {
         loop {
             let mut grant = self.get_writer_grant().await;
             match reader.read(grant.buf_mut()).await {
@@ -57,13 +59,12 @@ impl<'a, E> DevProducer<'a, E> {
                 }
                 Err(error) => {
                     grant.commit(0);
-                    self.insert_error(error);
+                    self.insert_error(error.into());
                     self.state.wait_reader.wake();
                 }
             }
         }
     }
-
 }
 
 pub struct DevConsumer<'a, E> {
@@ -97,7 +98,10 @@ impl<'a, E> DevConsumer<'a, E> {
     ///
     /// This will loop forever, *or* until the `writer` reaches an EOF condition.
     #[cfg(feature = "_any_embedded_io_async")]
-    pub async fn embedded_io_connect<W: Write<Error = E>>(&mut self, mut writer: W) {
+    pub async fn embedded_io_connect<W: Write>(&mut self, mut writer: W)
+    where
+        W::Error: Into<E>,
+    {
         loop {
             let grant = self.get_reader_grant().await;
 
@@ -109,7 +113,7 @@ impl<'a, E> DevConsumer<'a, E> {
                 }
                 Err(error) => {
                     grant.release(0);
-                    self.insert_error(error);
+                    self.insert_error(error.into());
                     self.state.wait_writer.wake();
                 }
             }
@@ -168,29 +172,28 @@ mod impl_futures {
 
 #[cfg(feature = "_any_embedded_io_async")]
 mod impl_embedded_io_async {
-    use crate::embedded_io_async::{ErrorType, Write, Read};
+    use crate::embedded_io_async::{ErrorType, Read, Write};
 
     use crate::{DevConsumer, DevProducer};
-
 
     impl<E> ErrorType for DevConsumer<'_, E> {
         type Error = core::convert::Infallible;
     }
-    
+
     impl<E> Write for DevProducer<'_, E> {
         async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
             Ok(DevProducer::write(self, buf).await)
         }
-        
+
         async fn flush(&mut self) -> Result<(), Self::Error> {
             Ok(())
         }
     }
-    
+
     impl<E> ErrorType for DevProducer<'_, E> {
         type Error = core::convert::Infallible;
     }
-    
+
     impl<E> Read for DevConsumer<'_, E> {
         async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
             Ok(DevConsumer::read(self, buf).await)
