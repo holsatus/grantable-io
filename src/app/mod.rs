@@ -120,10 +120,11 @@ impl<'a, E> AppConsumer<'a, E> {
 
 // ---- embedded-io-async impls ---- //
 
+#[cfg(feature = "_any_embedded_io_async")]
 mod impl_embedded_io_async {
 
     use crate::{AppConsumer, AppProducer};
-    use embedded_io_async::{BufRead, Error, ErrorType, Read, Write};
+    use crate::embedded_io_async::{BufRead, Error, ErrorType, Read, Write};
 
     impl<E: Error> ErrorType for AppProducer<'_, E> {
         type Error = E;
@@ -166,7 +167,6 @@ mod test {
     fn test_buf_read() {
         use crate::GrantableIo;
         use core::convert::Infallible;
-        use embedded_io_async::Write;
 
         const BUF: &[u8] = b"_foo_bar_baz";
 
@@ -174,7 +174,7 @@ mod test {
         let (mut hard, mut soft) = serial_port.claim_reader();
 
         futures_executor::block_on(async {
-            hard.write_all(BUF.as_ref()).await.unwrap();
+            hard.write_all(BUF.as_ref()).await;
 
             let mut buf = [0u8; 4];
 

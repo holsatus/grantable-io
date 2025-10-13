@@ -115,3 +115,12 @@ impl<const N: usize, E> GrantableIo<N, E> {
         ))
     }
 }
+
+#[cfg(feature = "embedded-io-async-070")]
+pub use embedded_io_async_070 as embedded_io_async;
+
+#[cfg(feature = "embedded-io-async-061")]
+pub use embedded_io_async_061 as embedded_io_async;
+
+#[cfg(feature = "embedded-io-async-060")]
+pub use embedded_io_async_060 as embedded_io_async;
