@@ -45,10 +45,17 @@ impl<'a, E> DevProducer<'a, E> {
     /// This will loop forever, or until the reader returns an EOF conditions,
     /// represented by a 0 byte read.
     #[cfg(feature = "_any_embedded_io_async")]
-    pub async fn embedded_io_connect<R: Read>(&mut self, mut reader: R)
-    where
-        R::Error: Into<E>,
-    {
+    pub async fn embedded_io_connect<R: Read<Error = E>>(&mut self, reader: R) {
+        self.embedded_io_connect_mapped(reader, |error| error).await
+    }
+
+    /// Connect this writer to another [`embedded_io_async::Read`], such that
+    /// all bytes received through `reader` will be copied to this writers buffer.
+    ///
+    /// This will loop forever, or until the reader returns an EOF conditions,
+    /// represented by a 0 byte read.
+    #[cfg(feature = "_any_embedded_io_async")]
+    pub async fn embedded_io_connect_mapped<R: Read>(&mut self, mut reader: R, map_err: impl Fn(R::Error) -> E) {
         loop {
             let mut grant = self.get_writer_grant().await;
             match reader.read(grant.buf_mut()).await {
@@ -59,7 +66,7 @@ impl<'a, E> DevProducer<'a, E> {
                 }
                 Err(error) => {
                     grant.commit(0);
-                    self.insert_error(error.into());
+                    self.insert_error(map_err(error));
                     self.state.wait_reader.wake();
                 }
             }
@@ -98,10 +105,16 @@ impl<'a, E> DevConsumer<'a, E> {
     ///
     /// This will loop forever, *or* until the `writer` reaches an EOF condition.
     #[cfg(feature = "_any_embedded_io_async")]
-    pub async fn embedded_io_connect<W: Write>(&mut self, mut writer: W)
-    where
-        W::Error: Into<E>,
-    {
+    pub async fn embedded_io_connect<W: Write<Error = E>>(&mut self, writer: W) {
+        self.embedded_io_connect_mapped(writer, |error| error).await
+    }
+
+    /// Connect this reader to another [`embedded_io_async::Write`], such that
+    /// all bytes received through this reader will be written to `writer`.
+    ///
+    /// This will loop forever, *or* until the `writer` reaches an EOF condition.
+    #[cfg(feature = "_any_embedded_io_async")]
+    pub async fn embedded_io_connect_mapped<W: Write>(&mut self, mut writer: W, map_err: impl Fn(W::Error) -> E) {
         loop {
             let grant = self.get_reader_grant().await;
 
@@ -113,7 +126,7 @@ impl<'a, E> DevConsumer<'a, E> {
                 }
                 Err(error) => {
                     grant.release(0);
-                    self.insert_error(error.into());
+                    self.insert_error(map_err(error));
                     self.state.wait_writer.wake();
                 }
             }
