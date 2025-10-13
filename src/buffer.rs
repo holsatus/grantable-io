@@ -1,10 +1,8 @@
 use core::{
-    cmp::min,
-    mem::forget,
+    marker::PhantomData,
     ptr::NonNull,
     slice::{from_raw_parts, from_raw_parts_mut},
 };
-use std::marker::PhantomData;
 
 use portable_atomic::{
     AtomicBool, AtomicUsize,
@@ -19,10 +17,10 @@ pub(crate) struct AtomicBuffer {
     initialized: AtomicBool,
 
     /// Where the next byte will be written
-    write: AtomicUsize,
+    writer: AtomicUsize,
 
     /// Where the next byte will be read from
-    read: AtomicUsize,
+    reader: AtomicUsize,
 
     /// Used in the inverted case to mark the end of the
     /// readable streak. Otherwise will == sizeof::<self.buf>().
@@ -30,7 +28,7 @@ pub(crate) struct AtomicBuffer {
     /// place when entering an inverted condition, and Reader
     /// is responsible for moving it back to sizeof::<self.buf>()
     /// when exiting the inverted condition
-    last: AtomicUsize,
+    wrapped: AtomicUsize,
 
     /// Used by the Writer to remember what bytes are currently
     /// allowed to be written to, but are not yet ready to be
@@ -57,13 +55,13 @@ impl AtomicBuffer {
             initialized: AtomicBool::new(false),
 
             // Owned by the writer
-            write: AtomicUsize::new(0),
+            writer: AtomicUsize::new(0),
 
             // Owned by the reader
-            read: AtomicUsize::new(0),
+            reader: AtomicUsize::new(0),
 
             // Cooperatively owned
-            last: AtomicUsize::new(0),
+            wrapped: AtomicUsize::new(0),
 
             // Owned by the writer
             reserve: AtomicUsize::new(0),
@@ -78,7 +76,7 @@ impl AtomicBuffer {
 
     /// Attempt to initialize the [`AtomicBuffer`] into [`Consumer`] and [`Producer`]
     /// halves. If buffer has already been initialized, `None` will be returned.
-    pub fn init(&self, buf: &mut [u8]) -> Option<(Producer<'_>, Consumer<'_>)> {
+    pub fn init<'a>(&'a self, buf: &'a mut [u8]) -> Option<(Producer<'a>, Consumer<'a>)> {
         if self.initialized.swap(true, AcqRel) {
             return None;
         }
@@ -113,16 +111,15 @@ impl<'a> Producer<'a> {
     /// Request a writable contiguous section of memory of at least 1 byte.
     ///
     /// Returns `None` if no space is currently available for writing.
-    pub fn get_grant(&mut self) -> Option<WriterGrant<'a>> {
-        let atomic = self.atomic;
-        
+    pub fn get_grant(&mut self) -> Option<ProduceGrant<'a>> {
+        let atomic = &self.atomic;
+
         if atomic.write_in_progress.swap(true, AcqRel) {
             panic!("Attempted to double-grant a write");
         }
-        
 
-        let write = atomic.write.load(Acquire);
-        let read = atomic.read.load(Acquire);
+        let write = atomic.writer.load(Acquire);
+        let read = atomic.reader.load(Acquire);
         let max = self.buffer.len();
 
         let (start, grant) = if write < read {
@@ -142,7 +139,7 @@ impl<'a> Producer<'a> {
 
             if space_at_start > space_at_end {
                 // Grant from the start is larger. Wrap around.
-                atomic.last.store(write, Release);
+                atomic.wrapped.store(write, Release);
                 (0, space_at_start)
             } else if space_at_end > 0 {
                 // Grant from the end is larger or equal. Use it.
@@ -160,10 +157,7 @@ impl<'a> Producer<'a> {
         // This is sound, as `NonNull` is `#[repr(transparent)]
         let grant = unsafe { &mut self.buffer.as_mut()[start..(start + grant)] };
 
-        Some(WriterGrant {
-            grant,
-            atomic,
-        })
+        Some(ProduceGrant { grant, atomic: self.atomic })
     }
 }
 
@@ -182,20 +176,20 @@ impl<'a> Consumer<'a> {
     /// contain ALL available bytes, if the writer has wrapped around. The
     /// remaining bytes will be available after all readable bytes are
     /// released
-    pub fn get_grant(&mut self) -> Option<ReaderGrant<'a>> {
-        let atomic = self.atomic;
+    pub fn get_grant(&mut self) -> Option<ConsumeGrant<'a>> {
+        let atomic = &self.atomic;
 
-        if self.atomic.read_in_progress.swap(true, AcqRel) {
+        if atomic.read_in_progress.swap(true, AcqRel) {
             panic!("Attempted to double-grant a read");
         }
 
-        let write = atomic.write.load(Acquire);
-        let last = atomic.last.load(Acquire);
-        let mut read = atomic.read.load(Acquire);
+        let write = atomic.writer.load(Acquire);
+        let last = atomic.wrapped.load(Acquire);
+        let mut read = atomic.reader.load(Acquire);
 
         // Resolve the inverted case or end of read
         if (read == last) && (write < read) {
-            atomic.read.store(0, Release);
+            atomic.reader.store(0, Release);
             read = 0;
         }
 
@@ -215,10 +209,7 @@ impl<'a> Consumer<'a> {
         // This is sound, as `NonNull` is `#[repr(transparent)]
         let grant = unsafe { &mut self.buffer.as_mut()[read..(read + grant)] };
 
-        Some(ReaderGrant {
-            grant,
-            atomic,
-        })
+        Some(ConsumeGrant { grant, atomic: self.atomic })
     }
 }
 
@@ -228,14 +219,14 @@ impl<'a> Consumer<'a> {
 /// NOTE: If the grant is dropped without explicitly commiting
 /// the contents, then no bytes will be comitted for writing.
 #[derive(Debug)]
-pub struct WriterGrant<'a> {
+pub struct ProduceGrant<'a> {
     grant: &'a mut [u8],
     atomic: &'a AtomicBuffer,
 }
 
-unsafe impl Send for WriterGrant<'_> {}
+unsafe impl Send for ProduceGrant<'_> {}
 
-impl WriterGrant<'_> {
+impl ProduceGrant<'_> {
     /// Copy the largest possible amount of bytes to the grant
     /// from the given buffer. Whichever is shorter decides the number
     /// of bytes written. The return value is the amount copied.
@@ -254,7 +245,7 @@ impl WriterGrant<'_> {
     /// available for subsequent reading grants. This consumes the grant.
     pub fn commit(mut self, used: usize) {
         self.commit_inner(used);
-        forget(self);
+        core::mem::forget(self);
     }
 
     /// Obtain access to the inner buffer for reading.
@@ -269,26 +260,28 @@ impl WriterGrant<'_> {
 
     #[inline(always)]
     fn commit_inner(&mut self, used: usize) {
+        let atomic = &self.atomic;
+
         // If there is no grant in progress, return early.
-        if !self.atomic.write_in_progress.load(Acquire) {
+        if !atomic.write_in_progress.load(Acquire) {
             return;
         }
 
         // Saturate the grant commit
         let len = self.grant.len();
-        let used = min(len, used);
+        let used = len.min(used);
 
-        let write = self.atomic.write.load(Acquire);
-        self.atomic.reserve.fetch_sub(len - used, AcqRel);
+        let write = atomic.writer.load(Acquire);
+        atomic.reserve.fetch_sub(len - used, AcqRel);
 
         let max = self.grant.len();
-        let last = self.atomic.last.load(Acquire);
-        let new_write = self.atomic.reserve.load(Acquire);
+        let last = atomic.wrapped.load(Acquire);
+        let new_write = atomic.reserve.load(Acquire);
 
         if (new_write < write) && (write != max) {
             // We have already wrapped, but we are skipping some bytes at the end of the ring.
             // Mark `last` where the write pointer used to be to hold the line here
-            self.atomic.last.store(write, Release);
+            atomic.wrapped.store(write, Release);
         } else if new_write > last {
             // We're about to pass the last pointer, which was previously the artificial
             // end of the ring. Now that we've passed it, we can "unlock" the section
@@ -297,7 +290,7 @@ impl WriterGrant<'_> {
             // Since new_write is strictly larger than last, it is safe to move this as
             // the other thread will still be halted by the (about to be updated) write
             // value
-            self.atomic.last.store(max, Release);
+            atomic.wrapped.store(max, Release);
         }
         // else: If new_write == last, either:
         // * last == max, so no need to write, OR
@@ -307,15 +300,15 @@ impl WriterGrant<'_> {
 
         // Write must be updated AFTER last, otherwise read could think it was
         // time to invert early!
-        self.atomic.write.store(new_write, Release);
+        atomic.writer.store(new_write, Release);
 
         // Allow subsequent grants
-        self.atomic.write_in_progress.store(false, Release);
+        atomic.write_in_progress.store(false, Release);
     }
 }
 
 // Ensure grant is released if no explicit call to `GrantW::release` is called.
-impl Drop for WriterGrant<'_> {
+impl Drop for ProduceGrant<'_> {
     fn drop(&mut self) {
         self.commit_inner(0);
     }
@@ -328,14 +321,14 @@ impl Drop for WriterGrant<'_> {
 /// NOTE: If the grant is dropped without explicitly releasing
 /// the contents, then no bytes will be released as read.
 #[derive(Debug)]
-pub struct ReaderGrant<'a> {
+pub struct ConsumeGrant<'a> {
     grant: &'a mut [u8],
     atomic: &'a AtomicBuffer,
 }
 
-unsafe impl Send for ReaderGrant<'_> {}
+unsafe impl Send for ConsumeGrant<'_> {}
 
-impl ReaderGrant<'_> {
+impl ConsumeGrant<'_> {
     /// Copy the largest possible amount of bytes from the grant
     /// to the given buffer. Whichever is shorter decides the number
     /// of bytes written. The return value is the amount copied.
@@ -354,7 +347,7 @@ impl ReaderGrant<'_> {
     /// available for subsequent writing grants. This consumes the grant.
     pub fn release(mut self, used: usize) {
         self.release_inner(used);
-        forget(self);
+        core::mem::forget(self);
     }
 
     /// Obtain access to the inner buffer for reading
@@ -372,26 +365,26 @@ impl ReaderGrant<'_> {
 
     #[inline(always)]
     fn release_inner(&mut self, used: usize) {
-        let inner = self.atomic;
+        let atomic = &self.atomic;
 
         // If there is no grant in progress, return early.
-        if !inner.read_in_progress.load(Acquire) {
+        if !atomic.read_in_progress.load(Acquire) {
             return;
         }
 
         // Saturate the grant release
-        let used = min(self.grant.len(), used);
+        let used = self.grant.len().min(used);
 
         // This should be fine, purely incrementing
-        let _ = inner.read.fetch_add(used, Release);
+        let _ = atomic.reader.fetch_add(used, Release);
 
         // Allow subsequent grants
-        inner.read_in_progress.store(false, Release);
+        atomic.read_in_progress.store(false, Release);
     }
 }
 
 // Ensure grant is released if no explicit call to `GrantR::release` is called.
-impl Drop for ReaderGrant<'_> {
+impl Drop for ConsumeGrant<'_> {
     fn drop(&mut self) {
         self.release_inner(0);
     }

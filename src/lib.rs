@@ -1,4 +1,4 @@
-// #![no_std]
+#![no_std]
 
 use core::cell::UnsafeCell;
 use maitake_sync::WaitCell;
@@ -16,9 +16,10 @@ use buffer::{AtomicBuffer, Consumer, Producer};
 mod error;
 use error::AtomicError;
 
+#[derive(Debug)]
 struct State<E> {
-    pub(crate) atomic: AtomicBuffer,
     pub(crate) error: AtomicError<E>,
+    pub(crate) atomic: AtomicBuffer,
     pub(crate) wait_writer: WaitCell,
     pub(crate) wait_reader: WaitCell,
 }
@@ -26,8 +27,8 @@ struct State<E> {
 impl<E> State<E> {
     const fn new() -> Self {
         Self {
-            atomic: AtomicBuffer::new(),
             error: AtomicError::new(),
+            atomic: AtomicBuffer::new(),
             wait_writer: WaitCell::new(),
             wait_reader: WaitCell::new(),
         }
@@ -35,16 +36,16 @@ impl<E> State<E> {
 }
 
 /// A structure that owns the shared state and the buffer for serial communication.
-pub struct AtomicIo<const N: usize, E> {
+pub struct GrantableIo<const N: usize, E> {
     state: State<E>,
     buffer: UnsafeCell<[u8; N]>,
     initialized: AtomicBool,
 }
 
-unsafe impl<const N: usize, E> Send for AtomicIo<N, E> {}
-unsafe impl<const N: usize, E> Sync for AtomicIo<N, E> {}
+unsafe impl<const N: usize, E> Send for GrantableIo<N, E> {}
+unsafe impl<const N: usize, E> Sync for GrantableIo<N, E> {}
 
-impl<const N: usize, E> AtomicIo<N, E> {
+impl<const N: usize, E> GrantableIo<N, E> {
     /// Creates a new, uninitialized SerialPort.
     pub const fn new() -> Self {
         assert!(N > 0, "The value of `N` must be non-zero");

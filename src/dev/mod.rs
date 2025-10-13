@@ -1,6 +1,5 @@
 use super::buffer::{Consumer, Producer};
 use embedded_io_async::{ErrorType, Read, Write};
-use maitake_sync::WaitCell;
 
 use super::State;
 
@@ -21,6 +20,13 @@ impl<'a, E> DevProducer<'a, E> {
     pub fn insert_error(&mut self, error: E) {
         self.state.error.set(error);
         self.state.wait_reader.wake();
+    }
+
+    pub fn get_writer_grant(&mut self) -> WriterGrantFuture<'_, 'a> {
+        WriterGrantFuture {
+            wait: &self.state.wait_writer,
+            producer: &mut self.producer,
+        }
     }
 
     /// Connect this writer to another [`embedded_io_async::Read`], such that
@@ -46,12 +52,6 @@ impl<'a, E> DevProducer<'a, E> {
         }
     }
 
-    fn get_writer_grant(&mut self) -> WriterGrantFuture<'_, 'a> {
-        WriterGrantFuture {
-            wait: &self.state.wait_writer,
-            producer: &mut self.producer,
-        }
-    }
 }
 
 pub struct DevConsumer<'a, E> {
@@ -71,6 +71,13 @@ impl<'a, E> DevConsumer<'a, E> {
     pub fn insert_error(&mut self, error: E) {
         self.state.error.set(error);
         self.state.wait_writer.wake();
+    }
+
+    fn get_reader_grant(&mut self) -> ReaderGrantFuture<'_, 'a> {
+        ReaderGrantFuture {
+            wait: &self.state.wait_reader,
+            consumer: &mut self.consumer,
+        }
     }
 
     /// Connect this reader to another [`embedded_io_async::Write`], such that
@@ -95,28 +102,21 @@ impl<'a, E> DevConsumer<'a, E> {
             }
         }
     }
-
-    fn get_reader_grant(&mut self) -> ReaderGrantFuture<'_, 'a> {
-        ReaderGrantFuture {
-            wait: &self.state.wait_reader,
-            consumer: &mut self.consumer,
-        }
-    }
 }
 
 pub struct WriterGrantFuture<'s, 'a> {
-    pub(crate) wait: &'a WaitCell,
+    pub(crate) wait: &'a maitake_sync::WaitCell,
     pub(crate) producer: &'s mut Producer<'a>,
 }
 
 pub struct ReaderGrantFuture<'s, 'a> {
-    pub(crate) wait: &'a WaitCell,
+    pub(crate) wait: &'a maitake_sync::WaitCell,
     pub(crate) consumer: &'s mut Consumer<'a>,
 }
 
 mod impl_futures {
     use crate::{
-        buffer::{ReaderGrant, WriterGrant},
+        buffer::{ConsumeGrant, ProduceGrant},
         dev::{ReaderGrantFuture, WriterGrantFuture},
     };
     use core::{
@@ -125,7 +125,7 @@ mod impl_futures {
     };
 
     impl<'s, 'a> Future for WriterGrantFuture<'s, 'a> {
-        type Output = WriterGrant<'a>;
+        type Output = ProduceGrant<'a>;
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             _ = self.wait.poll_wait(cx);
@@ -138,7 +138,7 @@ mod impl_futures {
     }
 
     impl<'s, 'a> Future for ReaderGrantFuture<'s, 'a> {
-        type Output = ReaderGrant<'a>;
+        type Output = ConsumeGrant<'a>;
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             _ = self.wait.poll_wait(cx);
