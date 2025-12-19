@@ -76,19 +76,19 @@ impl AtomicBuffer {
 
     /// Attempt to initialize the [`AtomicBuffer`] into [`Consumer`] and [`Producer`]
     /// halves. If buffer has already been initialized, `None` will be returned.
-    pub fn init<'a>(&'a self, buf: &'a mut [u8]) -> Option<(Producer<'a>, Consumer<'a>)> {
+    pub fn init<'a>(&'a self, buf: &'a mut [u8]) -> Option<(BufferWriter<'a>, BufferReader<'a>)> {
         if self.initialized.swap(true, AcqRel) {
             return None;
         }
 
         // SAFETY: We just checked above that it was not already initialized
         Some((
-            Producer {
+            BufferWriter {
                 buffer: NonNull::from(&*buf),
                 atomic: self,
                 pd: PhantomData,
             },
-            Consumer {
+            BufferReader {
                 buffer: NonNull::from(&*buf),
                 atomic: self,
                 pd: PhantomData,
@@ -97,21 +97,21 @@ impl AtomicBuffer {
     }
 }
 
-/// `Producer` is the primary interface for pushing data into a [`crate::SerialPort`].
+/// `Writer` is the primary interface for pushing data into a [`crate::GrantableIo`].
 #[derive(Debug)]
-pub struct Producer<'a> {
+pub struct BufferWriter<'a> {
     buffer: NonNull<[u8]>,
     atomic: &'a AtomicBuffer,
     pd: PhantomData<&'a mut [u8]>,
 }
 
-unsafe impl Send for Producer<'_> {}
+unsafe impl Send for BufferWriter<'_> {}
 
-impl<'a> Producer<'a> {
+impl<'a> BufferWriter<'a> {
     /// Request a writable contiguous section of memory of at least 1 byte.
     ///
     /// Returns `None` if no space is currently available for writing.
-    pub fn get_grant(&mut self) -> Option<ProduceGrant<'a>> {
+    pub fn get_grant(&mut self) -> Option<WriterGrant<'a>> {
         let atomic = &self.atomic;
 
         if atomic.write_in_progress.swap(true, AcqRel) {
@@ -157,29 +157,29 @@ impl<'a> Producer<'a> {
         // This is sound, as `NonNull` is `#[repr(transparent)]
         let grant = unsafe { &mut self.buffer.as_mut()[start..(start + grant)] };
 
-        Some(ProduceGrant {
+        Some(WriterGrant {
             grant,
             atomic: self.atomic,
         })
     }
 }
 
-/// `Consumer` is the primary interface for reading data from a `BBBuffer`.
+/// `Reader` is the primary interface for reading data from a [`crate::GrantableIo`]
 #[derive(Debug)]
-pub struct Consumer<'a> {
+pub struct BufferReader<'a> {
     buffer: NonNull<[u8]>,
     atomic: &'a AtomicBuffer,
     pd: PhantomData<&'a mut [u8]>,
 }
 
-unsafe impl Send for Consumer<'_> {}
+unsafe impl Send for BufferReader<'_> {}
 
-impl<'a> Consumer<'a> {
+impl<'a> BufferReader<'a> {
     /// Obtains a contiguous slice of committed bytes. This slice may not
     /// contain ALL available bytes, if the writer has wrapped around. The
     /// remaining bytes will be available after all readable bytes are
     /// released
-    pub fn get_grant(&mut self) -> Option<ConsumeGrant<'a>> {
+    pub fn get_grant(&mut self) -> Option<ReaderGrant<'a>> {
         let atomic = &self.atomic;
 
         if atomic.read_in_progress.swap(true, AcqRel) {
@@ -212,7 +212,7 @@ impl<'a> Consumer<'a> {
         // This is sound, as `NonNull` is `#[repr(transparent)]
         let grant = unsafe { &mut self.buffer.as_mut()[read..(read + grant)] };
 
-        Some(ConsumeGrant {
+        Some(ReaderGrant {
             grant,
             atomic: self.atomic,
         })
@@ -225,14 +225,14 @@ impl<'a> Consumer<'a> {
 /// NOTE: If the grant is dropped without explicitly commiting
 /// the contents, then no bytes will be comitted for writing.
 #[derive(Debug)]
-pub struct ProduceGrant<'a> {
+pub struct WriterGrant<'a> {
     grant: &'a mut [u8],
     atomic: &'a AtomicBuffer,
 }
 
-unsafe impl Send for ProduceGrant<'_> {}
+unsafe impl Send for WriterGrant<'_> {}
 
-impl ProduceGrant<'_> {
+impl WriterGrant<'_> {
     /// Copy the largest possible amount of bytes to the grant
     /// from the given buffer. Whichever is shorter decides the number
     /// of bytes written. The return value is the amount copied.
@@ -314,7 +314,7 @@ impl ProduceGrant<'_> {
 }
 
 // Ensure grant is released if no explicit call to `GrantW::release` is called.
-impl Drop for ProduceGrant<'_> {
+impl Drop for WriterGrant<'_> {
     fn drop(&mut self) {
         self.commit_inner(0);
     }
@@ -327,14 +327,14 @@ impl Drop for ProduceGrant<'_> {
 /// NOTE: If the grant is dropped without explicitly releasing
 /// the contents, then no bytes will be released as read.
 #[derive(Debug)]
-pub struct ConsumeGrant<'a> {
+pub struct ReaderGrant<'a> {
     grant: &'a mut [u8],
     atomic: &'a AtomicBuffer,
 }
 
-unsafe impl Send for ConsumeGrant<'_> {}
+unsafe impl Send for ReaderGrant<'_> {}
 
-impl ConsumeGrant<'_> {
+impl ReaderGrant<'_> {
     /// Copy the largest possible amount of bytes from the grant
     /// to the given buffer. Whichever is shorter decides the number
     /// of bytes written. The return value is the amount copied.
@@ -390,7 +390,7 @@ impl ConsumeGrant<'_> {
 }
 
 // Ensure grant is released if no explicit call to `GrantR::release` is called.
-impl Drop for ConsumeGrant<'_> {
+impl Drop for ReaderGrant<'_> {
     fn drop(&mut self) {
         self.release_inner(0);
     }

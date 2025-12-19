@@ -5,13 +5,13 @@ use maitake_sync::WaitCell;
 use portable_atomic::AtomicBool;
 
 mod dev;
-pub use dev::{DevConsumer, DevProducer};
+pub use dev::{DeviceReader, DeviceWriter};
 
 mod app;
-pub use app::{AppConsumer, AppProducer};
+pub use app::{Reader, Writer};
 
 mod buffer;
-use buffer::{AtomicBuffer, Consumer, Producer};
+use buffer::{AtomicBuffer, BufferReader, BufferWriter};
 
 mod error;
 use error::AtomicError;
@@ -56,7 +56,7 @@ impl<const N: usize, E> GrantableIo<N, E> {
         }
     }
 
-    fn try_claim_inner(&self) -> Option<(Producer<'_>, Consumer<'_>)> {
+    fn try_claim_inner(&self) -> Option<(BufferWriter<'_>, BufferReader<'_>)> {
         use core::sync::atomic::Ordering::AcqRel;
 
         // Ensure this is only called once
@@ -72,20 +72,21 @@ impl<const N: usize, E> GrantableIo<N, E> {
     }
 
     #[track_caller]
-    pub fn claim_reader(&self) -> (DevProducer<'_, E>, AppConsumer<'_, E>) {
+    pub fn claim_reader(&self) -> (DeviceWriter<'_, E>, Reader<'_, E>) {
         self.try_claim_reader()
             .expect("SerialPort already claimed, cannot be claimed again")
     }
 
-    pub fn try_claim_reader(&self) -> Option<(DevProducer<'_, E>, AppConsumer<'_, E>)> {
+    /// Try to claim this [`GrantableIo`] as a reading stream.
+    pub fn try_claim_reader(&self) -> Option<(DeviceWriter<'_, E>, Reader<'_, E>)> {
         let (producer, consumer) = self.try_claim_inner()?;
 
         Some((
-            DevProducer {
+            DeviceWriter {
                 producer,
                 state: &self.state,
             },
-            AppConsumer {
+            Reader {
                 consumer,
                 state: &self.state,
                 grant: None,
@@ -94,20 +95,20 @@ impl<const N: usize, E> GrantableIo<N, E> {
     }
 
     #[track_caller]
-    pub fn claim_writer(&self) -> (DevConsumer<'_, E>, AppProducer<'_, E>) {
+    pub fn claim_writer(&self) -> (DeviceReader<'_, E>, Writer<'_, E>) {
         self.try_claim_writer()
             .expect("SerialPort already claimed, cannot be claimed again")
     }
 
-    pub fn try_claim_writer(&self) -> Option<(DevConsumer<'_, E>, AppProducer<'_, E>)> {
+    pub fn try_claim_writer(&self) -> Option<(DeviceReader<'_, E>, Writer<'_, E>)> {
         let (producer, consumer) = self.try_claim_inner()?;
 
         Some((
-            DevConsumer {
+            DeviceReader {
                 consumer,
                 state: &self.state,
             },
-            AppProducer {
+            Writer {
                 producer,
                 state: &self.state,
                 grant: None,

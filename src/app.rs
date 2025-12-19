@@ -1,22 +1,22 @@
 use super::State;
-use super::buffer::{ConsumeGrant, Consumer, Producer};
-use crate::buffer::ProduceGrant;
+use super::buffer::{ReaderGrant, BufferReader, BufferWriter};
+use crate::buffer::WriterGrant;
 
-pub struct AppProducer<'a, E> {
-    pub(super) producer: Producer<'a>,
+pub struct Writer<'a, E> {
+    pub(super) producer: BufferWriter<'a>,
     pub(super) state: &'a State<E>,
-    pub(super) grant: Option<ProduceGrant<'a>>,
+    pub(super) grant: Option<WriterGrant<'a>>,
 }
 
-impl<'a, E> AppProducer<'a, E> {
+impl<'a, E> Writer<'a, E> {
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, E> {
-        let bytes = self.get_produce_grant().await?.copy_max_from(buf);
+        let bytes = self.get_writer_grant().await?.copy_max_from(buf);
         self.commit(bytes);
         Ok(bytes)
     }
 
     pub async fn buf_mut(&mut self) -> Result<&mut [u8], E> {
-        Ok(self.get_produce_grant().await?.buf_mut())
+        Ok(self.get_writer_grant().await?.buf_mut())
     }
 
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), E> {
@@ -38,7 +38,7 @@ impl<'a, E> AppProducer<'a, E> {
         self.state.wait_reader.wake();
     }
 
-    async fn get_produce_grant(&mut self) -> Result<&mut ProduceGrant<'a>, E> {
+    async fn get_writer_grant(&mut self) -> Result<&mut WriterGrant<'a>, E> {
         if let Some(error) = self.state.error.take() {
             return Err(error);
         }
@@ -64,25 +64,25 @@ impl<'a, E> AppProducer<'a, E> {
     }
 }
 
-pub struct AppConsumer<'a, E> {
-    pub(super) consumer: Consumer<'a>,
+pub struct Reader<'a, E> {
+    pub(super) consumer: BufferReader<'a>,
     pub(super) state: &'a State<E>,
-    pub(super) grant: Option<ConsumeGrant<'a>>,
+    pub(super) grant: Option<ReaderGrant<'a>>,
 }
 
-impl<'a, E> AppConsumer<'a, E> {
+impl<'a, E> Reader<'a, E> {
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, E> {
-        let bytes = self.get_consume_grant().await?.copy_max_into(buf);
+        let bytes = self.get_reader_grant().await?.copy_max_into(buf);
         self.release(bytes);
         Ok(bytes)
     }
 
     pub async fn fill_buf(&mut self) -> Result<&[u8], E> {
-        self.get_consume_grant().await.map(|grant| grant.buf())
+        self.get_reader_grant().await.map(|grant| grant.buf())
     }
 
     pub async fn fill_buf_mut(&mut self) -> Result<&mut [u8], E> {
-        self.get_consume_grant().await.map(|grant| grant.buf_mut())
+        self.get_reader_grant().await.map(|grant| grant.buf_mut())
     }
 
     pub fn release(&mut self, bytes: usize) {
@@ -92,7 +92,7 @@ impl<'a, E> AppConsumer<'a, E> {
         self.state.wait_writer.wake();
     }
 
-    async fn get_consume_grant(&mut self) -> Result<&mut ConsumeGrant<'a>, E> {
+    async fn get_reader_grant(&mut self) -> Result<&mut ReaderGrant<'a>, E> {
         if let Some(error) = self.state.error.take() {
             return Err(error);
         }
@@ -124,15 +124,15 @@ impl<'a, E> AppConsumer<'a, E> {
 mod impl_embedded_io_async {
 
     use crate::embedded_io_async::{BufRead, Error, ErrorType, Read, Write};
-    use crate::{AppConsumer, AppProducer};
+    use crate::{Reader, Writer};
 
-    impl<E: Error> ErrorType for AppProducer<'_, E> {
+    impl<E: Error> ErrorType for Writer<'_, E> {
         type Error = E;
     }
 
-    impl<E: Error> Write for AppProducer<'_, E> {
+    impl<E: Error> Write for Writer<'_, E> {
         async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-            AppProducer::write(self, buf).await
+            Writer::write(self, buf).await
         }
 
         async fn flush(&mut self) -> Result<(), Self::Error> {
@@ -140,23 +140,23 @@ mod impl_embedded_io_async {
         }
     }
 
-    impl<E: Error> ErrorType for AppConsumer<'_, E> {
+    impl<E: Error> ErrorType for Reader<'_, E> {
         type Error = E;
     }
 
-    impl<E: Error> Read for AppConsumer<'_, E> {
+    impl<E: Error> Read for Reader<'_, E> {
         async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-            AppConsumer::read(self, buf).await
+            Reader::read(self, buf).await
         }
     }
 
-    impl<E: Error> BufRead for AppConsumer<'_, E> {
+    impl<E: Error> BufRead for Reader<'_, E> {
         async fn fill_buf(&mut self) -> Result<&[u8], Self::Error> {
-            AppConsumer::fill_buf(self).await
+            Reader::fill_buf(self).await
         }
 
         fn consume(&mut self, bytes: usize) {
-            AppConsumer::release(self, bytes)
+            Reader::release(self, bytes)
         }
     }
 }

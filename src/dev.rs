@@ -1,24 +1,32 @@
-use super::buffer::{Consumer, Producer};
+use super::buffer::{BufferReader, BufferWriter};
 
+use crate::buffer::{ReaderGrant, WriterGrant};
 #[cfg(feature = "_any_embedded_io_async")]
 use crate::embedded_io_async::{Read, Write};
 
 use super::State;
 
-pub struct DevProducer<'a, E> {
-    pub(super) producer: Producer<'a>,
+/// Connects to the device-facing writing interface.
+pub struct DeviceWriter<'a, E> {
+    pub(super) producer: BufferWriter<'a>,
     pub(super) state: &'a State<E>,
 }
 
-impl<'a, E> DevProducer<'a, E> {
+impl<'a, E> DeviceWriter<'a, E> {
+    /// Write a non-zero number of bytes from the provided buffer into the stream.
+    /// 
+    /// Note: This wakes the reader automatically, so no need to call `wake_reader`
     pub async fn write(&mut self, buf: &[u8]) -> usize {
         let mut grant = self.get_writer_grant().await;
         let bytes = grant.copy_max_from(buf);
         grant.commit(bytes);
-        self.state.wait_reader.wake();
+        self.wake_reader();
         bytes
     }
 
+    /// Write all bytes from the provided buffer into the stream.
+    /// 
+    /// Note: This wakes the reader automatically, so no need to call `wake_reader`
     pub async fn write_all(&mut self, buf: &[u8]) {
         let mut buf = buf;
         while !buf.is_empty() {
@@ -27,16 +35,29 @@ impl<'a, E> DevProducer<'a, E> {
         }
     }
 
+    /// Insert an error into the stream.
+    /// 
+    /// Note: This wakes the reader automatically, so no need to call `wake_reader`
     pub fn insert_error(&mut self, error: E) {
         self.state.error.set(error);
         self.state.wait_reader.wake();
     }
 
-    pub fn get_writer_grant(&mut self) -> WriterGrantFuture<'_, 'a> {
-        WriterGrantFuture {
-            wait: &self.state.wait_writer,
-            producer: &mut self.producer,
+    /// Get a grant to write into
+    pub async fn get_writer_grant(&mut self) -> WriterGrant<'a> {
+        loop {
+            let subscriber = self.state.wait_writer.subscribe().await;
+
+            if let Some(grant) = self.producer.get_grant() {
+                return grant
+            }
+
+            _ = subscriber.await;
         }
+    }
+
+    pub fn wake_reader(&mut self) {
+        self.state.wait_reader.wake();
     }
 
     /// Connect this writer to another [`embedded_io_async::Read`], such that
@@ -62,42 +83,53 @@ impl<'a, E> DevProducer<'a, E> {
                 Ok(0) => break,
                 Ok(bytes) => {
                     grant.commit(bytes);
-                    self.state.wait_reader.wake();
+                    self.wake_reader();
                 }
                 Err(error) => {
                     grant.commit(0);
                     self.insert_error(map_err(error));
-                    self.state.wait_reader.wake();
                 }
             }
         }
     }
 }
 
-pub struct DevConsumer<'a, E> {
-    pub(super) consumer: Consumer<'a>,
+/// Connects to the device-facing reading interface.
+pub struct DeviceReader<'a, E> {
+    pub(super) consumer: BufferReader<'a>,
     pub(super) state: &'a State<E>,
 }
 
-impl<'a, E> DevConsumer<'a, E> {
+impl<'a, E> DeviceReader<'a, E> {
     pub async fn read(&mut self, buf: &mut [u8]) -> usize {
         let mut grant = self.get_reader_grant().await;
         let bytes = grant.copy_max_into(buf);
         grant.release(bytes);
-        self.state.wait_writer.wake();
+        self.wake_writer();
         bytes
     }
 
     pub fn insert_error(&mut self, error: E) {
         self.state.error.set(error);
-        self.state.wait_writer.wake();
+        self.wake_writer();
     }
 
-    fn get_reader_grant(&mut self) -> ReaderGrantFuture<'_, 'a> {
-        ReaderGrantFuture {
-            wait: &self.state.wait_reader,
-            consumer: &mut self.consumer,
+    /// Get a grant to read from
+    pub async fn get_reader_grant(&mut self) -> ReaderGrant<'a> {
+        loop {
+            let subscriber = self.state.wait_reader.subscribe().await;
+
+            if let Some(grant) = self.consumer.get_grant() {
+                return grant
+            }
+
+            _ = subscriber.await;
         }
+    }
+
+    /// Wake the writing end to notify it that 
+    pub fn wake_writer(&mut self) {
+        self.state.wait_writer.wake();
     }
 
     /// Connect this reader to another [`embedded_io_async::Write`], such that
@@ -122,60 +154,12 @@ impl<'a, E> DevConsumer<'a, E> {
                 Ok(0) => break,
                 Ok(bytes) => {
                     grant.release(bytes);
-                    self.state.wait_writer.wake();
+                    self.wake_writer();
                 }
                 Err(error) => {
                     grant.release(0);
                     self.insert_error(map_err(error));
-                    self.state.wait_writer.wake();
                 }
-            }
-        }
-    }
-}
-
-pub struct WriterGrantFuture<'s, 'a> {
-    pub(crate) wait: &'a maitake_sync::WaitCell,
-    pub(crate) producer: &'s mut Producer<'a>,
-}
-
-pub struct ReaderGrantFuture<'s, 'a> {
-    pub(crate) wait: &'a maitake_sync::WaitCell,
-    pub(crate) consumer: &'s mut Consumer<'a>,
-}
-
-mod impl_futures {
-    use crate::{
-        buffer::{ConsumeGrant, ProduceGrant},
-        dev::{ReaderGrantFuture, WriterGrantFuture},
-    };
-    use core::{
-        pin::Pin,
-        task::{Context, Poll},
-    };
-
-    impl<'s, 'a> Future for WriterGrantFuture<'s, 'a> {
-        type Output = ProduceGrant<'a>;
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            _ = self.wait.poll_wait(cx);
-
-            match self.producer.get_grant() {
-                Some(grant) => Poll::Ready(grant),
-                None => Poll::Pending,
-            }
-        }
-    }
-
-    impl<'s, 'a> Future for ReaderGrantFuture<'s, 'a> {
-        type Output = ConsumeGrant<'a>;
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            _ = self.wait.poll_wait(cx);
-
-            match self.consumer.get_grant() {
-                Some(grant) => Poll::Ready(grant),
-                None => Poll::Pending,
             }
         }
     }
@@ -187,15 +171,15 @@ mod impl_futures {
 mod impl_embedded_io_async {
     use crate::embedded_io_async::{ErrorType, Read, Write};
 
-    use crate::{DevConsumer, DevProducer};
+    use crate::{DeviceReader, DeviceWriter};
 
-    impl<E> ErrorType for DevConsumer<'_, E> {
+    impl<E> ErrorType for DeviceWriter<'_, E> {
         type Error = core::convert::Infallible;
     }
 
-    impl<E> Write for DevProducer<'_, E> {
+    impl<E> Write for DeviceWriter<'_, E> {
         async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-            Ok(DevProducer::write(self, buf).await)
+            Ok(DeviceWriter::write(self, buf).await)
         }
 
         async fn flush(&mut self) -> Result<(), Self::Error> {
@@ -203,13 +187,13 @@ mod impl_embedded_io_async {
         }
     }
 
-    impl<E> ErrorType for DevProducer<'_, E> {
+    impl<E> ErrorType for DeviceReader<'_, E> {
         type Error = core::convert::Infallible;
     }
 
-    impl<E> Read for DevConsumer<'_, E> {
+    impl<E> Read for DeviceReader<'_, E> {
         async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-            Ok(DevConsumer::read(self, buf).await)
+            Ok(DeviceReader::read(self, buf).await)
         }
     }
 }
