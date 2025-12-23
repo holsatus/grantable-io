@@ -225,14 +225,14 @@ pub struct WriterGrant<'a> {
 
 unsafe impl Send for WriterGrant<'_> {}
 
-impl<'a> Deref for WriterGrant<'a> {
+impl Deref for WriterGrant<'_> {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
         unsafe { self.buffer.as_ref() }
     }
 }
 
-impl<'a> DerefMut for WriterGrant<'a> {
+impl DerefMut for WriterGrant<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { self.buffer.as_mut() }
     }
@@ -244,7 +244,7 @@ impl WriterGrant<'_> {
     /// of bytes written. The return value is the amount copied.
     pub fn copy_max_from(&mut self, buf: &[u8]) -> usize {
         // Maximum number of bytes that can be copied contiguously
-        let amount = self.len().min(buf.len());
+        let amount = self.buffer.len().min(buf.len());
 
         // Copy `amount` bytes from `grant` to `buf`
         self[..amount].copy_from_slice(&buf[..amount]);
@@ -265,7 +265,7 @@ impl WriterGrant<'_> {
         let atomic = self.state;
 
         // Saturate the grant commit
-        let used = self.len().min(used);
+        let used = self.buffer.len().min(used);
 
         // Move the write index forward by used count
         atomic.writer.store(self.start_offset + used, Release);
@@ -298,14 +298,14 @@ pub struct ReaderGrant<'a> {
 
 unsafe impl Send for ReaderGrant<'_> {}
 
-impl<'a> Deref for ReaderGrant<'a> {
+impl Deref for ReaderGrant<'_> {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
         unsafe { self.buffer.as_ref() }
     }
 }
 
-impl<'a> DerefMut for ReaderGrant<'a> {
+impl DerefMut for ReaderGrant<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { self.buffer.as_mut() }
     }
@@ -317,7 +317,7 @@ impl ReaderGrant<'_> {
     /// of bytes written. The return value is the amount copied.
     pub fn copy_max_into(&mut self, buf: &mut [u8]) -> usize {
         // Maximum number of bytes that can be copied contiguously
-        let amount = self.len().min(buf.len());
+        let amount = self.buffer.len().min(buf.len());
 
         // Copy `amount` bytes from `grant` to `buf`
         buf[..amount].copy_from_slice(&self[..amount]);
@@ -338,7 +338,7 @@ impl ReaderGrant<'_> {
         let state = self.state;
 
         // Saturate the grant release
-        let used = self.len().min(used);
+        let used = self.buffer.len().min(used);
 
         // This should be fine, purely incrementing
         state.reader.store(self.start_offset + used, Release);
