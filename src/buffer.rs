@@ -1,18 +1,19 @@
 use core::{
     marker::PhantomData,
+    ops::{Deref, DerefMut},
     ptr::NonNull,
-    slice::{from_raw_parts, from_raw_parts_mut},
+    slice::from_raw_parts_mut,
 };
 
 use portable_atomic::{
     AtomicBool, AtomicUsize,
-    Ordering::{AcqRel, Acquire, Release},
+    Ordering::{Acquire, Relaxed, Release},
 };
 
 #[derive(Debug)]
 /// An atomic "tracking" structure for safely granting
-/// read and write access to a contiguous slice of memory.
-pub(crate) struct AtomicBuffer {
+/// read and write access to contiguous slices of memory.
+pub struct BufferState {
     /// Whether this instance has been initialized
     initialized: AtomicBool,
 
@@ -22,18 +23,8 @@ pub(crate) struct AtomicBuffer {
     /// Where the next byte will be read from
     reader: AtomicUsize,
 
-    /// Used in the inverted case to mark the end of the
-    /// readable streak. Otherwise will == sizeof::<self.buf>().
-    /// Writer is responsible for placing this at the correct
-    /// place when entering an inverted condition, and Reader
-    /// is responsible for moving it back to sizeof::<self.buf>()
-    /// when exiting the inverted condition
+    /// Where the writer has wrapped around if writer < reader
     wrapped: AtomicUsize,
-
-    /// Used by the Writer to remember what bytes are currently
-    /// allowed to be written to, but are not yet ready to be
-    /// read from
-    reserve: AtomicUsize,
 
     /// Is there an active read grant?
     read_in_progress: AtomicBool,
@@ -42,13 +33,13 @@ pub(crate) struct AtomicBuffer {
     write_in_progress: AtomicBool,
 }
 
-impl Default for AtomicBuffer {
+impl Default for BufferState {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl AtomicBuffer {
+impl BufferState {
     /// Create a new instance of an [`AtomicBuffer`].
     pub const fn new() -> Self {
         Self {
@@ -63,9 +54,6 @@ impl AtomicBuffer {
             // Cooperatively owned
             wrapped: AtomicUsize::new(0),
 
-            // Owned by the writer
-            reserve: AtomicUsize::new(0),
-
             // Owned by the reader
             read_in_progress: AtomicBool::new(false),
 
@@ -77,21 +65,21 @@ impl AtomicBuffer {
     /// Attempt to initialize the [`AtomicBuffer`] into [`Consumer`] and [`Producer`]
     /// halves. If buffer has already been initialized, `None` will be returned.
     pub fn init<'a>(&'a self, buf: &'a mut [u8]) -> Option<(BufferWriter<'a>, BufferReader<'a>)> {
-        if self.initialized.swap(true, AcqRel) {
+        if self.initialized.swap(true, Acquire) {
             return None;
         }
 
-        // SAFETY: We just checked above that it was not already initialized
+        // Only create a pointer from the exclusive reference once
+        let ptr = NonNull::from(buf);
+
         Some((
             BufferWriter {
-                buffer: NonNull::from(&*buf),
-                atomic: self,
-                pd: PhantomData,
+                buffer: ptr,
+                state: self,
             },
             BufferReader {
-                buffer: NonNull::from(&*buf),
-                atomic: self,
-                pd: PhantomData,
+                buffer: ptr,
+                state: self,
             },
         ))
     }
@@ -101,8 +89,7 @@ impl AtomicBuffer {
 #[derive(Debug)]
 pub struct BufferWriter<'a> {
     buffer: NonNull<[u8]>,
-    atomic: &'a AtomicBuffer,
-    pd: PhantomData<&'a mut [u8]>,
+    state: &'a BufferState,
 }
 
 unsafe impl Send for BufferWriter<'_> {}
@@ -111,55 +98,51 @@ impl<'a> BufferWriter<'a> {
     /// Request a writable contiguous section of memory of at least 1 byte.
     ///
     /// Returns `None` if no space is currently available for writing.
-    pub fn get_grant(&mut self) -> Option<WriterGrant<'a>> {
-        let atomic = &self.atomic;
+    pub fn get_writer_grant(&mut self) -> Option<WriterGrant<'a>> {
+        let state = &self.state;
 
-        if atomic.write_in_progress.swap(true, AcqRel) {
-            panic!("Attempted to double-grant a write");
+        if state.write_in_progress.swap(true, Acquire) {
+            debug_assert!(false, "Attempted to double-grant a read");
+            return None;
         }
 
-        let write = atomic.writer.load(Acquire);
-        let read = atomic.reader.load(Acquire);
-        let max = self.buffer.len();
+        let write = state.writer.load(Relaxed);
+        let read = state.reader.load(Acquire);
 
-        let (start, grant) = if write < read {
-            // --- Inverted case ---
-            let space = read - write - 1;
-            if space == 0 {
-                atomic.write_in_progress.store(false, Release);
-                return None;
-            }
-            (write, space)
+        let is_inverted = write < read;
+        let (start, grant_len) = if is_inverted {
+            (write, read - write - 1)
         } else {
-            // --- Non-inverted case ---
-            let space_at_end = max - write;
-            // Space at the start is from index 0 up to `read`.
-            // We must leave one byte empty, so `write` never equals `read`.
-            let space_at_start = if read == 0 { 0 } else { read - 1 };
+            let space_at_end = self.buffer.len() - write;
+            let space_at_start = read.saturating_sub(1);
 
+            // Wrap around if space at start is larger
             if space_at_start > space_at_end {
-                // Grant from the start is larger. Wrap around.
-                atomic.wrapped.store(write, Release);
+                state.wrapped.store(write, Release);
                 (0, space_at_start)
-            } else if space_at_end > 0 {
-                // Grant from the end is larger or equal. Use it.
-                (write, space_at_end)
             } else {
-                // No space anywhere.
-                atomic.write_in_progress.store(false, Release);
-                return None;
+                (write, space_at_end)
             }
         };
 
-        // Safe write, only viewed by this task
-        atomic.reserve.store(start + grant, Release);
+        // Return if we were not granted anything
+        if grant_len == 0 {
+            state.write_in_progress.store(false, Release);
+            return None;
+        }
 
-        // This is sound, as `NonNull` is `#[repr(transparent)]
-        let grant = unsafe { &mut self.buffer.as_mut()[start..(start + grant)] };
+        // Construct *unique* mutable slice to the grant
+        let grant_buf = unsafe {
+            let base_ptr = self.buffer.cast::<u8>();
+            let grant_ptr = base_ptr.add(start).as_ptr();
+            from_raw_parts_mut(grant_ptr, grant_len)
+        };
 
         Some(WriterGrant {
-            grant,
-            atomic: self.atomic,
+            buffer: NonNull::from(grant_buf),
+            state: self.state,
+            start_offset: start,
+            _p: PhantomData,
         })
     }
 }
@@ -167,9 +150,8 @@ impl<'a> BufferWriter<'a> {
 /// `Reader` is the primary interface for reading data from a [`crate::GrantableIo`]
 #[derive(Debug)]
 pub struct BufferReader<'a> {
-    buffer: NonNull<[u8]>,
-    atomic: &'a AtomicBuffer,
-    pd: PhantomData<&'a mut [u8]>,
+    pub buffer: NonNull<[u8]>,
+    state: &'a BufferState,
 }
 
 unsafe impl Send for BufferReader<'_> {}
@@ -179,42 +161,51 @@ impl<'a> BufferReader<'a> {
     /// contain ALL available bytes, if the writer has wrapped around. The
     /// remaining bytes will be available after all readable bytes are
     /// released
-    pub fn get_grant(&mut self) -> Option<ReaderGrant<'a>> {
-        let atomic = &self.atomic;
+    pub fn get_reader_grant(&mut self) -> Option<ReaderGrant<'a>> {
+        let state = &self.state;
 
-        if atomic.read_in_progress.swap(true, AcqRel) {
-            panic!("Attempted to double-grant a read");
-        }
-
-        let write = atomic.writer.load(Acquire);
-        let last = atomic.wrapped.load(Acquire);
-        let mut read = atomic.reader.load(Acquire);
-
-        // Resolve the inverted case or end of read
-        if (read == last) && (write < read) {
-            atomic.reader.store(0, Release);
-            read = 0;
-        }
-
-        // Get largest available grant
-        let is_inverted = write < read;
-        let grant = if is_inverted {
-            last - read
-        } else {
-            write - read
-        };
-
-        if grant == 0 {
-            atomic.read_in_progress.store(false, Release);
+        if state.read_in_progress.swap(true, Acquire) {
+            debug_assert!(false, "Attempted to double-grant a read");
             return None;
         }
 
-        // This is sound, as `NonNull` is `#[repr(transparent)]
-        let grant = unsafe { &mut self.buffer.as_mut()[read..(read + grant)] };
+        let writer = state.writer.load(Acquire);
+        let wrapped = state.wrapped.load(Acquire);
+        let mut reader = state.reader.load(Relaxed);
+
+        // Resolve the inverted case or end of read
+        if (reader == wrapped) && writer < reader {
+            state.reader.store(0, Release);
+            reader = 0;
+        }
+
+        // Get largest available grant
+        let is_inverted = writer < reader;
+        let grant_len = if is_inverted {
+            wrapped - reader
+        } else {
+            writer - reader
+        };
+
+        // Return if we were not granted anything
+        if grant_len == 0 {
+            state.read_in_progress.store(false, Release);
+            return None;
+        }
+
+        // Construct *unique* mutable slice to the grant
+        let grant_buf = unsafe {
+            let base_ptr = self.buffer.cast::<u8>();
+            let grant_ptr = base_ptr.add(reader).as_ptr();
+
+            from_raw_parts_mut(grant_ptr, grant_len)
+        };
 
         Some(ReaderGrant {
-            grant,
-            atomic: self.atomic,
+            buffer: NonNull::from(grant_buf),
+            state: self.state,
+            start_offset: reader,
+            _p: PhantomData,
         })
     }
 }
@@ -226,22 +217,37 @@ impl<'a> BufferReader<'a> {
 /// the contents, then no bytes will be comitted for writing.
 #[derive(Debug)]
 pub struct WriterGrant<'a> {
-    grant: &'a mut [u8],
-    atomic: &'a AtomicBuffer,
+    buffer: NonNull<[u8]>,
+    pub state: &'a BufferState,
+    start_offset: usize,
+    _p: PhantomData<&'a mut [u8]>,
 }
 
 unsafe impl Send for WriterGrant<'_> {}
+
+impl<'a> Deref for WriterGrant<'a> {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.buffer.as_ref() }
+    }
+}
+
+impl<'a> DerefMut for WriterGrant<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self.buffer.as_mut() }
+    }
+}
 
 impl WriterGrant<'_> {
     /// Copy the largest possible amount of bytes to the grant
     /// from the given buffer. Whichever is shorter decides the number
     /// of bytes written. The return value is the amount copied.
-    pub(crate) fn copy_max_from(&mut self, buf: &[u8]) -> usize {
+    pub fn copy_max_from(&mut self, buf: &[u8]) -> usize {
         // Maximum number of bytes that can be copied contiguously
-        let amount = self.buf().len().min(buf.len());
+        let amount = self.len().min(buf.len());
 
         // Copy `amount` bytes from `grant` to `buf`
-        self.buf_mut()[..amount].copy_from_slice(&buf[..amount]);
+        self[..amount].copy_from_slice(&buf[..amount]);
 
         // The number copied
         amount
@@ -254,59 +260,15 @@ impl WriterGrant<'_> {
         core::mem::forget(self);
     }
 
-    /// Obtain access to the inner buffer for reading.
-    pub fn buf(&self) -> &[u8] {
-        unsafe { from_raw_parts(self.grant.as_ptr() as *const u8, self.grant.len()) }
-    }
-
-    /// Obtain mutable access to the read grant.
-    pub fn buf_mut(&mut self) -> &mut [u8] {
-        unsafe { from_raw_parts_mut(self.grant.as_ptr() as *mut u8, self.grant.len()) }
-    }
-
     #[inline(always)]
     fn commit_inner(&mut self, used: usize) {
-        let atomic = &self.atomic;
-
-        // If there is no grant in progress, return early.
-        if !atomic.write_in_progress.load(Acquire) {
-            return;
-        }
+        let atomic = self.state;
 
         // Saturate the grant commit
-        let len = self.grant.len();
-        let used = len.min(used);
+        let used = self.len().min(used);
 
-        let write = atomic.writer.load(Acquire);
-        atomic.reserve.fetch_sub(len - used, AcqRel);
-
-        let max = self.grant.len();
-        let last = atomic.wrapped.load(Acquire);
-        let new_write = atomic.reserve.load(Acquire);
-
-        if (new_write < write) && (write != max) {
-            // We have already wrapped, but we are skipping some bytes at the end of the ring.
-            // Mark `last` where the write pointer used to be to hold the line here
-            atomic.wrapped.store(write, Release);
-        } else if new_write > last {
-            // We're about to pass the last pointer, which was previously the artificial
-            // end of the ring. Now that we've passed it, we can "unlock" the section
-            // that was previously skipped.
-            //
-            // Since new_write is strictly larger than last, it is safe to move this as
-            // the other thread will still be halted by the (about to be updated) write
-            // value
-            atomic.wrapped.store(max, Release);
-        }
-        // else: If new_write == last, either:
-        // * last == max, so no need to write, OR
-        // * If we write in the end chunk again, we'll update last to max next time
-        // * If we write to the start chunk in a wrap, we'll update last when we
-        //     move write backwards
-
-        // Write must be updated AFTER last, otherwise read could think it was
-        // time to invert early!
-        atomic.writer.store(new_write, Release);
+        // Move the write index forward by used count
+        atomic.writer.store(self.start_offset + used, Release);
 
         // Allow subsequent grants
         atomic.write_in_progress.store(false, Release);
@@ -328,22 +290,37 @@ impl Drop for WriterGrant<'_> {
 /// the contents, then no bytes will be released as read.
 #[derive(Debug)]
 pub struct ReaderGrant<'a> {
-    grant: &'a mut [u8],
-    atomic: &'a AtomicBuffer,
+    buffer: NonNull<[u8]>,
+    pub state: &'a BufferState,
+    start_offset: usize,
+    _p: PhantomData<&'a mut [u8]>,
 }
 
 unsafe impl Send for ReaderGrant<'_> {}
+
+impl<'a> Deref for ReaderGrant<'a> {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.buffer.as_ref() }
+    }
+}
+
+impl<'a> DerefMut for ReaderGrant<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self.buffer.as_mut() }
+    }
+}
 
 impl ReaderGrant<'_> {
     /// Copy the largest possible amount of bytes from the grant
     /// to the given buffer. Whichever is shorter decides the number
     /// of bytes written. The return value is the amount copied.
-    pub(crate) fn copy_max_into(&mut self, buf: &mut [u8]) -> usize {
+    pub fn copy_max_into(&mut self, buf: &mut [u8]) -> usize {
         // Maximum number of bytes that can be copied contiguously
-        let amount = self.buf().len().min(buf.len());
+        let amount = self.len().min(buf.len());
 
         // Copy `amount` bytes from `grant` to `buf`
-        buf[..amount].copy_from_slice(&self.buf()[..amount]);
+        buf[..amount].copy_from_slice(&self[..amount]);
 
         // The number copied
         amount
@@ -356,36 +333,18 @@ impl ReaderGrant<'_> {
         core::mem::forget(self);
     }
 
-    /// Obtain access to the inner buffer for reading
-    pub fn buf(&self) -> &[u8] {
-        unsafe { from_raw_parts(self.grant.as_ptr() as *const u8, self.grant.len()) }
-    }
-
-    /// Obtain mutable access to the read grant
-    ///
-    /// This is useful if you are performing in-place operations
-    /// on an incoming packet, such as decryption
-    pub fn buf_mut(&mut self) -> &mut [u8] {
-        unsafe { from_raw_parts_mut(self.grant.as_ptr() as *mut u8, self.grant.len()) }
-    }
-
     #[inline(always)]
     fn release_inner(&mut self, used: usize) {
-        let atomic = &self.atomic;
-
-        // If there is no grant in progress, return early.
-        if !atomic.read_in_progress.load(Acquire) {
-            return;
-        }
+        let state = self.state;
 
         // Saturate the grant release
-        let used = self.grant.len().min(used);
+        let used = self.len().min(used);
 
         // This should be fine, purely incrementing
-        let _ = atomic.reader.fetch_add(used, Release);
+        state.reader.store(self.start_offset + used, Release);
 
         // Allow subsequent grants
-        atomic.read_in_progress.store(false, Release);
+        state.read_in_progress.store(false, Release);
     }
 }
 
@@ -398,11 +357,12 @@ impl Drop for ReaderGrant<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::AtomicBuffer;
+
+    use super::BufferState;
 
     #[test]
     fn catch_double_init() {
-        let state = AtomicBuffer::new();
+        let state = BufferState::new();
 
         let mut buffer0 = [0u8; 8];
         let mut buffer1 = [0u8; 8];
@@ -414,18 +374,18 @@ mod tests {
     #[test]
     fn small_write_read() {
         let mut buffer = [0u8; 8];
-        let state = AtomicBuffer::new();
+        let state = BufferState::new();
         let (mut prod, mut cons) = state.init(buffer.as_mut()).unwrap();
 
-        assert!(cons.get_grant().is_none());
+        assert!(cons.get_reader_grant().is_none());
 
         let payload = [1u8; 2];
-        let mut writer = prod.get_grant().unwrap();
+        let mut writer = prod.get_writer_grant().unwrap();
         let bytes = writer.copy_max_from(&payload);
         writer.commit(bytes);
 
         let mut packet = [0u8; 16];
-        let mut reader = cons.get_grant().unwrap();
+        let mut reader = cons.get_reader_grant().unwrap();
         let bytes = reader.copy_max_into(&mut packet);
         reader.release(bytes);
 
@@ -435,35 +395,35 @@ mod tests {
     #[test]
     fn wrapping_write_read() {
         let mut buffer = [0u8; 8];
-        let state = AtomicBuffer::new();
+        let state = BufferState::new();
         let (mut prod, mut cons) = state.init(buffer.as_mut()).unwrap();
 
-        assert!(cons.get_grant().is_none());
+        assert!(cons.get_reader_grant().is_none());
 
         // Initial bytes [0,0,0,0,0,0,0,0]
 
         let payload = [1, 2, 3, 4, 5, 6];
-        let mut writer = prod.get_grant().unwrap();
+        let mut writer = prod.get_writer_grant().unwrap();
         let bytes = writer.copy_max_from(&payload);
         assert_eq!(bytes, 6);
         writer.commit(bytes);
         // Written 6 bytes [W,W,W,W,W,W,0,0]
 
         let mut packet = [0u8; 4];
-        let mut reader = cons.get_grant().unwrap();
+        let mut reader = cons.get_reader_grant().unwrap();
         let bytes = reader.copy_max_into(&mut packet);
         assert_eq!(&packet[..bytes], &[1, 2, 3, 4]);
         reader.release(bytes);
         // Read 4 bytes [r,r,r,r,W,W,0,0]
 
-        let mut reader = cons.get_grant().unwrap();
-        assert_eq!(reader.buf(), &[5, 6]);
+        let mut reader = cons.get_reader_grant().unwrap();
+        assert_eq!(&*reader, &[5, 6]);
         // Hold on to the reading grant
 
         let payload = [7, 8, 9, 10, 11, 12];
-        let mut writer = prod.get_grant().unwrap();
+        let mut writer = prod.get_writer_grant().unwrap();
         let bytes = writer.copy_max_from(&payload);
-        assert_eq!(&writer.buf()[..bytes], &[7, 8, 9], "buffer: {:?}", state);
+        assert_eq!(&writer[..bytes], &[7, 8, 9], "buffer: {:?}", state);
         writer.commit(bytes);
         // Written 3 bytes [W,W,W,r,W,W,0,0]
 
@@ -473,13 +433,13 @@ mod tests {
         reader.release(bytes);
         // Read last 2 bytes [W,W,W,r,r,r,0,0]
 
-        let mut reader = cons.get_grant().unwrap();
+        let mut reader = cons.get_reader_grant().unwrap();
         let bytes = reader.copy_max_into(&mut packet);
         assert_eq!(bytes, 3, "buffer: {:?}", state);
         reader.release(bytes);
         // Read first 3 bytes [r,r,r,r,r,r,0,0]
 
-        let writer = prod.get_grant().unwrap();
-        assert_eq!(writer.buf(), &[4, 5, 6, 0, 0])
+        let writer = prod.get_writer_grant().unwrap();
+        assert_eq!(&*writer, &[4, 5, 6, 0, 0])
     }
 }

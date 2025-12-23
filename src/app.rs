@@ -1,22 +1,24 @@
 use super::State;
-use super::buffer::{ReaderGrant, BufferReader, BufferWriter};
+use super::buffer::{BufferReader, BufferWriter, ReaderGrant};
 use crate::buffer::WriterGrant;
 
 pub struct Writer<'a, E> {
-    pub(super) producer: BufferWriter<'a>,
+    pub(super) writer: BufferWriter<'a>,
     pub(super) state: &'a State<E>,
     pub(super) grant: Option<WriterGrant<'a>>,
 }
 
 impl<'a, E> Writer<'a, E> {
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, E> {
-        let bytes = self.get_writer_grant().await?.copy_max_from(buf);
+        let grant = self.get_writer_grant().await?;
+        let bytes = grant.copy_max_from(buf);
         self.commit(bytes);
         Ok(bytes)
     }
 
     pub async fn buf_mut(&mut self) -> Result<&mut [u8], E> {
-        Ok(self.get_writer_grant().await?.buf_mut())
+        let grant = self.get_writer_grant().await?;
+        Ok(&mut *grant)
     }
 
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), E> {
@@ -39,10 +41,7 @@ impl<'a, E> Writer<'a, E> {
     }
 
     async fn get_writer_grant(&mut self) -> Result<&mut WriterGrant<'a>, E> {
-        if let Some(error) = self.state.error.take() {
-            return Err(error);
-        }
-
+        // No need to check error before using pre-existing grant.
         if self.grant.is_some() {
             return Ok(self.grant.as_mut().unwrap());
         }
@@ -50,39 +49,41 @@ impl<'a, E> Writer<'a, E> {
         loop {
             let subscription = self.state.wait_writer.subscribe().await;
 
-            if let Some(grant) = self.producer.get_grant() {
-                return Ok(self.grant.insert(grant));
-            }
-
-            let res = subscription.await;
-            debug_assert!(res.is_ok());
-
             if let Some(error) = self.state.error.take() {
                 return Err(error);
             }
+
+            if let Some(grant) = self.writer.get_writer_grant() {
+                return Ok(self.grant.insert(grant));
+            }
+
+            _ = subscription.await;
         }
     }
 }
 
 pub struct Reader<'a, E> {
-    pub(super) consumer: BufferReader<'a>,
+    pub(super) reader: BufferReader<'a>,
     pub(super) state: &'a State<E>,
     pub(super) grant: Option<ReaderGrant<'a>>,
 }
 
 impl<'a, E> Reader<'a, E> {
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, E> {
-        let bytes = self.get_reader_grant().await?.copy_max_into(buf);
+        let grant = self.get_reader_grant().await?;
+        let bytes = grant.copy_max_into(buf);
         self.release(bytes);
         Ok(bytes)
     }
 
     pub async fn fill_buf(&mut self) -> Result<&[u8], E> {
-        self.get_reader_grant().await.map(|grant| grant.buf())
+        let grant = self.get_reader_grant().await?;
+        Ok(&*grant)
     }
 
     pub async fn fill_buf_mut(&mut self) -> Result<&mut [u8], E> {
-        self.get_reader_grant().await.map(|grant| grant.buf_mut())
+        let grant = self.get_reader_grant().await?;
+        Ok(&mut *grant)
     }
 
     pub fn release(&mut self, bytes: usize) {
@@ -93,10 +94,7 @@ impl<'a, E> Reader<'a, E> {
     }
 
     async fn get_reader_grant(&mut self) -> Result<&mut ReaderGrant<'a>, E> {
-        if let Some(error) = self.state.error.take() {
-            return Err(error);
-        }
-
+        // No need to check error before using pre-existing grant.
         if self.grant.is_some() {
             return Ok(self.grant.as_mut().unwrap());
         }
@@ -104,16 +102,15 @@ impl<'a, E> Reader<'a, E> {
         loop {
             let subscription = self.state.wait_reader.subscribe().await;
 
-            if let Some(grant) = self.consumer.get_grant() {
-                return Ok(self.grant.insert(grant));
-            }
-
-            let res = subscription.await;
-            debug_assert!(res.is_ok());
-
             if let Some(error) = self.state.error.take() {
                 return Err(error);
             }
+
+            if let Some(grant) = self.reader.get_reader_grant() {
+                return Ok(self.grant.insert(grant));
+            }
+
+            _ = subscription.await;
         }
     }
 }

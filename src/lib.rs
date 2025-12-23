@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 use core::cell::UnsafeCell;
 use maitake_sync::WaitCell;
@@ -11,7 +11,7 @@ mod app;
 pub use app::{Reader, Writer};
 
 mod buffer;
-use buffer::{AtomicBuffer, BufferReader, BufferWriter};
+pub use buffer::{BufferReader, BufferState, BufferWriter};
 
 mod error;
 use error::AtomicError;
@@ -19,7 +19,7 @@ use error::AtomicError;
 #[derive(Debug)]
 struct State<E> {
     pub(crate) error: AtomicError<E>,
-    pub(crate) atomic: AtomicBuffer,
+    pub(crate) state: BufferState,
     pub(crate) wait_writer: WaitCell,
     pub(crate) wait_reader: WaitCell,
 }
@@ -28,7 +28,7 @@ impl<E> State<E> {
     const fn new() -> Self {
         Self {
             error: AtomicError::new(),
-            atomic: AtomicBuffer::new(),
+            state: BufferState::new(),
             wait_writer: WaitCell::new(),
             wait_reader: WaitCell::new(),
         }
@@ -68,26 +68,26 @@ impl<const N: usize, E> GrantableIo<N, E> {
         // buffer once, and use it with this particular buffer state.
         let buffer = unsafe { &mut *self.buffer.get() };
 
-        self.state.atomic.init(buffer)
+        self.state.state.init(buffer)
     }
 
     #[track_caller]
     pub fn claim_reader(&self) -> (DeviceWriter<'_, E>, Reader<'_, E>) {
         self.try_claim_reader()
-            .expect("SerialPort already claimed, cannot be claimed again")
+            .expect("GrantableIo already claimed, cannot be claimed again")
     }
 
     /// Try to claim this [`GrantableIo`] as a reading stream.
     pub fn try_claim_reader(&self) -> Option<(DeviceWriter<'_, E>, Reader<'_, E>)> {
-        let (producer, consumer) = self.try_claim_inner()?;
+        let (writer, reader) = self.try_claim_inner()?;
 
         Some((
             DeviceWriter {
-                producer,
+                writer,
                 state: &self.state,
             },
             Reader {
-                consumer,
+                reader,
                 state: &self.state,
                 grant: None,
             },
@@ -97,19 +97,19 @@ impl<const N: usize, E> GrantableIo<N, E> {
     #[track_caller]
     pub fn claim_writer(&self) -> (DeviceReader<'_, E>, Writer<'_, E>) {
         self.try_claim_writer()
-            .expect("SerialPort already claimed, cannot be claimed again")
+            .expect("GrantableIo already claimed, cannot be claimed again")
     }
 
     pub fn try_claim_writer(&self) -> Option<(DeviceReader<'_, E>, Writer<'_, E>)> {
-        let (producer, consumer) = self.try_claim_inner()?;
+        let (writer, reader) = self.try_claim_inner()?;
 
         Some((
             DeviceReader {
-                consumer,
+                reader,
                 state: &self.state,
             },
             Writer {
-                producer,
+                writer,
                 state: &self.state,
                 grant: None,
             },
