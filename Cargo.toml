@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 
 [features]
-default = ["embedded-io-async-061"]
+default = ["embedded-io-async-070"]
 
 embedded-io-async-070 = ["dep:embedded-io-async-070", "_any_embedded_io_async"]
 embedded-io-async-061 = ["dep:embedded-io-async-061", "_any_embedded_io_async"]
