@@ -150,7 +150,7 @@ impl<'a> BufferWriter<'a> {
 /// `Reader` is the primary interface for reading data from a [`crate::GrantableIo`]
 #[derive(Debug)]
 pub struct BufferReader<'a> {
-    pub buffer: NonNull<[u8]>,
+    buffer: NonNull<[u8]>,
     state: &'a BufferState,
 }
 
@@ -218,7 +218,7 @@ impl<'a> BufferReader<'a> {
 #[derive(Debug)]
 pub struct WriterGrant<'a> {
     buffer: NonNull<[u8]>,
-    pub state: &'a BufferState,
+    state: &'a BufferState,
     start_offset: usize,
     _p: PhantomData<&'a mut [u8]>,
 }
@@ -291,7 +291,7 @@ impl Drop for WriterGrant<'_> {
 #[derive(Debug)]
 pub struct ReaderGrant<'a> {
     buffer: NonNull<[u8]>,
-    pub state: &'a BufferState,
+    state: &'a BufferState,
     start_offset: usize,
     _p: PhantomData<&'a mut [u8]>,
 }

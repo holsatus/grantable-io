@@ -11,7 +11,7 @@ mod app;
 pub use app::{Reader, Writer};
 
 mod buffer;
-pub use buffer::{BufferReader, BufferState, BufferWriter};
+use buffer::{BufferReader, BufferState, BufferWriter};
 
 mod error;
 use error::AtomicError;
