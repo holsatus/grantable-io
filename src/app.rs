@@ -138,7 +138,6 @@ impl<'a, E> Reader<'a, E> {
         Ok(bytes)
     }
 
-
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, E> {
         if buf.is_empty() {
             return Ok(0);
