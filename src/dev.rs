@@ -1,3 +1,5 @@
+use core::num::NonZeroUsize;
+
 use super::buffer::{BufferReader, BufferWriter};
 
 use crate::buffer::{ReaderGrant, WriterGrant};
@@ -17,7 +19,11 @@ impl<'a, E> DeviceWriter<'a, E> {
     ///
     /// Note: This wakes the reader automatically, so no need to call `wake_reader`
     pub async fn write(&mut self, buf: &[u8]) -> usize {
-        let mut grant = self.get_writer_grant().await;
+        let Some(buf_len) = NonZeroUsize::new(buf.len()) else {
+            return 0;
+        };
+
+        let mut grant = self.get_writer_grant(buf_len).await;
         let bytes = grant.copy_max_from(buf);
         grant.commit(bytes);
         self.wake_reader();
@@ -30,7 +36,6 @@ impl<'a, E> DeviceWriter<'a, E> {
     pub async fn write_all(&mut self, buf: &[u8]) {
         let mut buf = buf;
         while !buf.is_empty() {
-            // The write method will always write a non-zero number of bytes
             let bytes = self.write(buf).await;
             buf = &buf[bytes..];
         }
@@ -45,11 +50,11 @@ impl<'a, E> DeviceWriter<'a, E> {
     }
 
     /// Get a grant to write into
-    pub async fn get_writer_grant(&mut self) -> WriterGrant<'_> {
+    pub async fn get_writer_grant(&mut self, buf_len: NonZeroUsize) -> WriterGrant<'_> {
         loop {
             let subscriber = self.state.wait_writer.subscribe().await;
 
-            match self.writer.get_writer_grant() {
+            match self.writer.try_get_writer_grant(buf_len) {
                 Some(grant) => return grant,
                 None => _ = subscriber.await,
             }
@@ -63,26 +68,17 @@ impl<'a, E> DeviceWriter<'a, E> {
     /// Connect this writer to another [`embedded_io_async::Read`], such that
     /// all bytes received through `reader` will be copied to this writers buffer.
     ///
-    /// This will loop forever, or until the reader returns an EOF conditions,
-    /// represented by a 0 byte read.
-    #[cfg(feature = "_any_embedded_io_async")]
-    pub async fn embedded_io_connect<R: Read<Error = E>>(&mut self, reader: R) {
-        self.embedded_io_connect_mapped(reader, |error| error).await
-    }
-
-    /// Connect this writer to another [`embedded_io_async::Read`], such that
-    /// all bytes received through `reader` will be copied to this writers buffer.
-    ///
     /// This will loop forever, or until the reader reaches an EOF conditions,
     /// represented by a 0 byte read.
     #[cfg(feature = "_any_embedded_io_async")]
-    pub async fn embedded_io_connect_mapped<R: Read>(
+    pub async fn embedded_io_connect<R: Read>(
         &mut self,
         mut reader: R,
         map_err: impl Fn(R::Error) -> E,
     ) {
         loop {
-            let mut grant = self.get_writer_grant().await;
+            const BUF_LEN_GRACE: NonZeroUsize = NonZeroUsize::new(32).unwrap();
+            let mut grant = self.get_writer_grant(BUF_LEN_GRACE).await;
             match reader.read(&mut grant).await {
                 Ok(0) => break,
                 Ok(bytes) => {
@@ -108,7 +104,7 @@ impl<'a, E> DeviceReader<'a, E> {
     pub async fn read(&mut self, buf: &mut [u8]) -> usize {
         let mut grant = self.get_reader_grant().await;
         let bytes = grant.copy_max_into(buf);
-        grant.release(bytes);
+        grant.consume(bytes);
         self.wake_writer();
         bytes
     }
@@ -123,7 +119,7 @@ impl<'a, E> DeviceReader<'a, E> {
         loop {
             let subscriber = self.state.wait_reader.subscribe().await;
 
-            if let Some(grant) = self.reader.get_reader_grant() {
+            if let Some(grant) = self.reader.try_get_reader_grant() {
                 return grant;
             }
 
@@ -161,11 +157,11 @@ impl<'a, E> DeviceReader<'a, E> {
             match writer.write(&grant).await {
                 Ok(0) => break,
                 Ok(bytes) => {
-                    grant.release(bytes);
+                    grant.consume(bytes);
                     self.wake_writer();
                 }
                 Err(error) => {
-                    grant.release(0);
+                    grant.consume(0);
                     self.insert_error(map_err(error));
                 }
             }

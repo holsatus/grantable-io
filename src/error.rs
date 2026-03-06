@@ -25,10 +25,13 @@ impl<E> AtomicError<E> {
     }
 
     pub(crate) fn take(&self) -> Option<E> {
-        if self.has_error.fetch_and(false, Ordering::AcqRel) {
-            self.error.with_lock(|inner| inner.take())
-        } else {
-            None
+        if !self.has_error.load(Ordering::Acquire) {
+            return None;
         }
+
+        self.error.with_lock(|inner| {
+            self.has_error.store(false, Ordering::Release);
+            inner.take()
+        })
     }
 }

@@ -42,8 +42,8 @@ pub struct GrantableIo<const N: usize, E> {
     initialized: AtomicBool,
 }
 
-unsafe impl<const N: usize, E> Send for GrantableIo<N, E> {}
-unsafe impl<const N: usize, E> Sync for GrantableIo<N, E> {}
+unsafe impl<const N: usize, E: Send> Send for GrantableIo<N, E> {}
+unsafe impl<const N: usize, E: Send> Sync for GrantableIo<N, E> {}
 
 impl<const N: usize, E> GrantableIo<N, E> {
     /// Creates a new, uninitialized SerialPort.

@@ -1,3 +1,5 @@
+use core::num::NonZeroUsize;
+
 use super::State;
 use super::buffer::{BufferReader, BufferWriter, ReaderGrant};
 use crate::buffer::WriterGrant;
@@ -9,15 +11,51 @@ pub struct Writer<'a, E> {
 }
 
 impl<'a, E> Writer<'a, E> {
+    pub fn writable_bytes(&self) -> usize {
+        self.writer.writable_bytes()
+    }
+
+    pub fn readable_bytes(&self) -> usize {
+        self.writer.readable_bytes()
+    }
+
+    pub fn try_write(&mut self, buf: &[u8]) -> Result<usize, E> {
+        let Some(buf_len) = NonZeroUsize::new(buf.len()) else {
+            return Ok(0);
+        };
+
+        let grant = match self.grant.as_mut() {
+            Some(grant) => grant,
+            None => {
+                if let Some(error) = self.state.error.take() {
+                    return Err(error);
+                }
+
+                match self.writer.try_get_writer_grant(buf_len) {
+                    Some(grant) => self.grant.insert(grant),
+                    None => return Ok(0),
+                }
+            }
+        };
+
+        let bytes = grant.copy_max_from(buf);
+        self.commit(bytes);
+        Ok(bytes)
+    }
+
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, E> {
-        let grant = self.get_writer_grant().await?;
+        let Some(buf_len) = NonZeroUsize::new(buf.len()) else {
+            return Ok(0);
+        };
+
+        let grant = self.get_writer_grant(buf_len).await?;
         let bytes = grant.copy_max_from(buf);
         self.commit(bytes);
         Ok(bytes)
     }
 
     pub async fn buf_mut(&mut self) -> Result<&mut [u8], E> {
-        let grant = self.get_writer_grant().await?;
+        let grant = self.get_writer_grant(NonZeroUsize::MAX).await?;
         Ok(&mut *grant)
     }
 
@@ -25,7 +63,6 @@ impl<'a, E> Writer<'a, E> {
         let mut buf = buf;
         while !buf.is_empty() {
             match self.write(buf).await {
-                Ok(0) => panic!("write() returned Ok(0)"),
                 Ok(n) => buf = &buf[n..],
                 Err(e) => return Err(e),
             }
@@ -40,7 +77,7 @@ impl<'a, E> Writer<'a, E> {
         self.state.wait_reader.wake();
     }
 
-    async fn get_writer_grant(&mut self) -> Result<&mut WriterGrant<'a>, E> {
+    async fn get_writer_grant(&mut self, buf_len: NonZeroUsize) -> Result<&mut WriterGrant<'a>, E> {
         // No need to check error before using pre-existing grant.
         if self.grant.is_some() {
             return Ok(self.grant.as_mut().unwrap());
@@ -53,7 +90,7 @@ impl<'a, E> Writer<'a, E> {
                 return Err(error);
             }
 
-            if let Some(grant) = self.writer.get_writer_grant() {
+            if let Some(grant) = self.writer.try_get_writer_grant(buf_len) {
                 return Ok(self.grant.insert(grant));
             }
 
@@ -69,10 +106,47 @@ pub struct Reader<'a, E> {
 }
 
 impl<'a, E> Reader<'a, E> {
+    pub fn writable_bytes(&self) -> usize {
+        self.reader.writable_bytes()
+    }
+
+    pub fn readable_bytes(&self) -> usize {
+        self.reader.readable_bytes()
+    }
+
+    pub fn try_read(&mut self, buf: &mut [u8]) -> Result<usize, E> {
+        if buf.is_empty() {
+            return Ok(0);
+        };
+
+        let grant = match self.grant.as_mut() {
+            Some(grant) => grant,
+            None => {
+                if let Some(error) = self.state.error.take() {
+                    return Err(error);
+                }
+
+                match self.reader.try_get_reader_grant() {
+                    Some(grant) => self.grant.insert(grant),
+                    None => return Ok(0),
+                }
+            }
+        };
+
+        let bytes = grant.copy_max_into(buf);
+        self.consume(bytes);
+        Ok(bytes)
+    }
+
+
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, E> {
+        if buf.is_empty() {
+            return Ok(0);
+        };
+
         let grant = self.get_reader_grant().await?;
         let bytes = grant.copy_max_into(buf);
-        self.release(bytes);
+        self.consume(bytes);
         Ok(bytes)
     }
 
@@ -86,9 +160,9 @@ impl<'a, E> Reader<'a, E> {
         Ok(&mut *grant)
     }
 
-    pub fn release(&mut self, bytes: usize) {
+    pub fn consume(&mut self, bytes: usize) {
         if let Some(grant) = self.grant.take() {
-            grant.release(bytes);
+            grant.consume(bytes);
         }
         self.state.wait_writer.wake();
     }
@@ -106,7 +180,7 @@ impl<'a, E> Reader<'a, E> {
                 return Err(error);
             }
 
-            if let Some(grant) = self.reader.get_reader_grant() {
+            if let Some(grant) = self.reader.try_get_reader_grant() {
                 return Ok(self.grant.insert(grant));
             }
 
@@ -153,7 +227,7 @@ mod impl_embedded_io_async {
         }
 
         fn consume(&mut self, bytes: usize) {
-            Reader::release(self, bytes)
+            Reader::consume(self, bytes)
         }
     }
 }

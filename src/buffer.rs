@@ -2,6 +2,7 @@ use core::{
     marker::PhantomData,
     ops::{Deref, DerefMut},
     ptr::NonNull,
+    num::NonZeroUsize,
     slice::from_raw_parts_mut,
 };
 
@@ -62,9 +63,41 @@ impl BufferState {
         }
     }
 
+    /// Get the number of writeable bytes in the buffer of length `len`.
+    pub fn writable_bytes(&self, len: usize) -> usize {
+        let writer = self.writer.load(Relaxed);
+        let reader = self.reader.load(Acquire);
+
+        // Detect inverted case
+        if writer < reader {
+            reader - writer - 1
+        } else {
+            len - (writer - reader)
+        }
+    }
+
+    /// Get the number of readable bytes in the buffer.
+    pub fn readable_bytes(&self) -> usize {
+        let writer = self.writer.load(Acquire);
+        let wrapped = self.wrapped.load(Acquire);
+        let mut reader = self.reader.load(Relaxed);
+
+        // Same boundary normalization used by get_reader_grant
+        if (reader == wrapped) && writer < reader {
+            reader = 0;
+        }
+
+        // Detect inverted case
+        if writer < reader {
+            wrapped.saturating_sub(reader) + writer
+        } else {
+            writer - reader
+        }
+    }
+
     /// Attempt to initialize the [`AtomicBuffer`] into [`Consumer`] and [`Producer`]
     /// halves. If buffer has already been initialized, `None` will be returned.
-    pub fn init<'a>(&'a self, buf: &'a mut [u8]) -> Option<(BufferWriter<'a>, BufferReader<'a>)> {
+    pub fn init(&self, buf: &mut [u8]) -> Option<(BufferWriter<'_>, BufferReader<'_>)> {
         if self.initialized.swap(true, Acquire) {
             return None;
         }
@@ -95,10 +128,18 @@ pub struct BufferWriter<'a> {
 unsafe impl Send for BufferWriter<'_> {}
 
 impl<'a> BufferWriter<'a> {
+    pub fn writable_bytes(&self) -> usize {
+        self.state.writable_bytes(self.buffer.len())
+    }
+
+    pub fn readable_bytes(&self) -> usize {
+        self.state.readable_bytes()
+    }
+
     /// Request a writable contiguous section of memory of at least 1 byte.
     ///
     /// Returns `None` if no space is currently available for writing.
-    pub fn get_writer_grant(&mut self) -> Option<WriterGrant<'a>> {
+    pub fn try_get_writer_grant(&mut self, buf_len: NonZeroUsize) -> Option<WriterGrant<'a>> {
         let state = &self.state;
 
         if state.write_in_progress.swap(true, Acquire) {
@@ -117,7 +158,7 @@ impl<'a> BufferWriter<'a> {
             let space_at_start = read.saturating_sub(1);
 
             // Wrap around if space at start is larger
-            if space_at_start > space_at_end {
+            if space_at_start > space_at_end && buf_len.get() > space_at_end {
                 state.wrapped.store(write, Release);
                 (0, space_at_start)
             } else {
@@ -157,11 +198,19 @@ pub struct BufferReader<'a> {
 unsafe impl Send for BufferReader<'_> {}
 
 impl<'a> BufferReader<'a> {
+    pub fn writable_bytes(&self) -> usize {
+        self.state.writable_bytes(self.buffer.len())
+    }
+
+    pub fn readable_bytes(&self) -> usize {
+        self.state.readable_bytes()
+    }
+
     /// Obtains a contiguous slice of committed bytes. This slice may not
     /// contain ALL available bytes, if the writer has wrapped around. The
     /// remaining bytes will be available after all readable bytes are
-    /// released
-    pub fn get_reader_grant(&mut self) -> Option<ReaderGrant<'a>> {
+    /// consumed
+    pub fn try_get_reader_grant(&mut self) -> Option<ReaderGrant<'a>> {
         let state = &self.state;
 
         if state.read_in_progress.swap(true, Acquire) {
@@ -192,6 +241,8 @@ impl<'a> BufferReader<'a> {
             state.read_in_progress.store(false, Release);
             return None;
         }
+
+        assert!(reader + grant_len <= self.buffer.len());
 
         // Construct *unique* mutable slice to the grant
         let grant_buf = unsafe {
@@ -275,7 +326,7 @@ impl WriterGrant<'_> {
     }
 }
 
-// Ensure grant is released if no explicit call to `GrantW::release` is called.
+// Ensure grant is consumed if no explicit call to `WriterGrant::commit` is called.
 impl Drop for WriterGrant<'_> {
     fn drop(&mut self) {
         self.commit_inner(0);
@@ -283,11 +334,11 @@ impl Drop for WriterGrant<'_> {
 }
 
 /// A structure representing a contiguous region of memory that
-/// may be read from, and potentially "released" (or cleared)
+/// may be read from, and potentially "consumed" (or cleared)
 /// from the queue
 ///
 /// NOTE: If the grant is dropped without explicitly releasing
-/// the contents, then no bytes will be released as read.
+/// the contents, then no bytes will be consumed as read.
 #[derive(Debug)]
 pub struct ReaderGrant<'a> {
     buffer: NonNull<[u8]>,
@@ -328,16 +379,16 @@ impl ReaderGrant<'_> {
 
     /// Finalizes this readable grant and makes `used` bytes of read data
     /// available for subsequent writing grants. This consumes the grant.
-    pub fn release(mut self, used: usize) {
-        self.release_inner(used);
+    pub fn consume(mut self, used: usize) {
+        self.consume_inner(used);
         core::mem::forget(self);
     }
 
     #[inline(always)]
-    fn release_inner(&mut self, used: usize) {
+    fn consume_inner(&mut self, used: usize) {
         let state = self.state;
 
-        // Saturate the grant release
+        // Saturate the grant consume
         let used = self.buffer.len().min(used);
 
         // This should be fine, purely incrementing
@@ -348,15 +399,17 @@ impl ReaderGrant<'_> {
     }
 }
 
-// Ensure grant is released if no explicit call to `GrantR::release` is called.
+// Ensure grant is consumed if no explicit call to `ReaderGrant::consume` is called.
 impl Drop for ReaderGrant<'_> {
     fn drop(&mut self) {
-        self.release_inner(0);
+        self.consume_inner(0);
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    use std::num::NonZeroUsize;
 
     use super::BufferState;
 
@@ -377,17 +430,17 @@ mod tests {
         let state = BufferState::new();
         let (mut prod, mut cons) = state.init(buffer.as_mut()).unwrap();
 
-        assert!(cons.get_reader_grant().is_none());
+        assert!(cons.try_get_reader_grant().is_none());
 
         let payload = [1u8; 2];
-        let mut writer = prod.get_writer_grant().unwrap();
+        let mut writer = prod.try_get_writer_grant(NonZeroUsize::MAX).unwrap();
         let bytes = writer.copy_max_from(&payload);
         writer.commit(bytes);
 
         let mut packet = [0u8; 16];
-        let mut reader = cons.get_reader_grant().unwrap();
+        let mut reader = cons.try_get_reader_grant().unwrap();
         let bytes = reader.copy_max_into(&mut packet);
-        reader.release(bytes);
+        reader.consume(bytes);
 
         assert_eq!(&packet[..bytes], &payload);
     }
@@ -398,30 +451,30 @@ mod tests {
         let state = BufferState::new();
         let (mut prod, mut cons) = state.init(buffer.as_mut()).unwrap();
 
-        assert!(cons.get_reader_grant().is_none());
+        assert!(cons.try_get_reader_grant().is_none());
 
         // Initial bytes [0,0,0,0,0,0,0,0]
 
         let payload = [1, 2, 3, 4, 5, 6];
-        let mut writer = prod.get_writer_grant().unwrap();
+        let mut writer = prod.try_get_writer_grant(NonZeroUsize::MAX).unwrap();
         let bytes = writer.copy_max_from(&payload);
         assert_eq!(bytes, 6);
         writer.commit(bytes);
         // Written 6 bytes [W,W,W,W,W,W,0,0]
 
         let mut packet = [0u8; 4];
-        let mut reader = cons.get_reader_grant().unwrap();
+        let mut reader = cons.try_get_reader_grant().unwrap();
         let bytes = reader.copy_max_into(&mut packet);
         assert_eq!(&packet[..bytes], &[1, 2, 3, 4]);
-        reader.release(bytes);
+        reader.consume(bytes);
         // Read 4 bytes [r,r,r,r,W,W,0,0]
 
-        let mut reader = cons.get_reader_grant().unwrap();
+        let mut reader = cons.try_get_reader_grant().unwrap();
         assert_eq!(&*reader, &[5, 6]);
         // Hold on to the reading grant
 
         let payload = [7, 8, 9, 10, 11, 12];
-        let mut writer = prod.get_writer_grant().unwrap();
+        let mut writer = prod.try_get_writer_grant(NonZeroUsize::MAX).unwrap();
         let bytes = writer.copy_max_from(&payload);
         assert_eq!(&writer[..bytes], &[7, 8, 9], "buffer: {:?}", state);
         writer.commit(bytes);
@@ -430,16 +483,175 @@ mod tests {
         let mut packet = [0u8; 16];
         let bytes = reader.copy_max_into(&mut packet);
         assert_eq!(bytes, 2, "buffer: {:?}", state);
-        reader.release(bytes);
+        reader.consume(bytes);
         // Read last 2 bytes [W,W,W,r,r,r,0,0]
 
-        let mut reader = cons.get_reader_grant().unwrap();
+        let mut reader = cons.try_get_reader_grant().unwrap();
         let bytes = reader.copy_max_into(&mut packet);
         assert_eq!(bytes, 3, "buffer: {:?}", state);
-        reader.release(bytes);
+        reader.consume(bytes);
         // Read first 3 bytes [r,r,r,r,r,r,0,0]
 
-        let writer = prod.get_writer_grant().unwrap();
+        let writer = prod.try_get_writer_grant(NonZeroUsize::MAX).unwrap();
         assert_eq!(&*writer, &[4, 5, 6, 0, 0])
+    }
+
+    #[test]
+    fn writer_grant_does_not_wrap_if_buf_fits_at_end() {
+        let mut buffer = [0u8; 8];
+        let state = BufferState::new();
+        let (mut prod, mut cons) = state.init(buffer.as_mut()).unwrap();
+
+        // write=6, read=0
+        let payload = [1, 2, 3, 4, 5, 6];
+        let mut writer = prod.try_get_writer_grant(NonZeroUsize::MAX).unwrap();
+        let bytes = writer.copy_max_from(&payload);
+        assert_eq!(bytes, 6);
+        writer.commit(bytes);
+
+        // write=6, read=4 -> space_at_end=2, space_at_start=3
+        let mut scratch = [0u8; 4];
+        let mut reader = cons.try_get_reader_grant().unwrap();
+        let bytes = reader.copy_max_into(&mut scratch);
+        assert_eq!(bytes, 4);
+        reader.consume(bytes);
+
+        // Requested bytes fit at end, so do not wrap early.
+        let mut writer = prod.try_get_writer_grant(NonZeroUsize::new(2).unwrap()).unwrap();
+        assert_eq!(writer.len(), 2);
+        writer.copy_max_from(&[9, 9]);
+        writer.commit(2);
+
+        let mut out = [0u8; 8];
+        let mut reader = cons.try_get_reader_grant().unwrap();
+        let bytes = reader.copy_max_into(&mut out);
+        assert_eq!(bytes, 4);
+        assert_eq!(&out[..bytes], &[5, 6, 9, 9]);
+        reader.consume(bytes);
+    }
+
+    #[test]
+    fn writer_grant_wraps_when_requested_buf_does_not_fit_at_end() {
+        let mut buffer = [0u8; 8];
+        let state = BufferState::new();
+        let (mut prod, mut cons) = state.init(buffer.as_mut()).unwrap();
+
+        // write=6, read=0
+        let payload = [1, 2, 3, 4, 5, 6];
+        let mut writer = prod.try_get_writer_grant(NonZeroUsize::MAX).unwrap();
+        let bytes = writer.copy_max_from(&payload);
+        assert_eq!(bytes, 6);
+        writer.commit(bytes);
+
+        // write=6, read=4 -> space_at_end=2, space_at_start=3
+        let mut scratch = [0u8; 4];
+        let mut reader = cons.try_get_reader_grant().unwrap();
+        let bytes = reader.copy_max_into(&mut scratch);
+        assert_eq!(bytes, 4);
+        reader.consume(bytes);
+
+        // Requested bytes do not fit at end, so wrap to larger start segment.
+        let mut writer = prod.try_get_writer_grant(NonZeroUsize::new(3).unwrap()).unwrap();
+        assert_eq!(writer.len(), 3);
+        writer.copy_max_from(&[7, 8, 9]);
+        writer.commit(3);
+
+        let mut out = [0u8; 8];
+
+        // First drain tail segment before wrap marker.
+        let mut reader = cons.try_get_reader_grant().unwrap();
+        let bytes = reader.copy_max_into(&mut out);
+        assert_eq!(bytes, 2);
+        assert_eq!(&out[..bytes], &[5, 6]);
+        reader.consume(bytes);
+
+        // Then read wrapped data from the start segment.
+        let mut reader = cons.try_get_reader_grant().unwrap();
+        let bytes = reader.copy_max_into(&mut out);
+        assert_eq!(bytes, 3);
+        assert_eq!(&out[..bytes], &[7, 8, 9]);
+        reader.consume(bytes);
+    }
+
+    #[test]
+    fn readable_bytes_non_inverted() {
+        let mut buffer = [0u8; 8];
+        let state = BufferState::new();
+        let (mut prod, mut cons) = state.init(buffer.as_mut()).unwrap();
+
+        let mut writer = prod.try_get_writer_grant(NonZeroUsize::MAX).unwrap();
+        let bytes = writer.copy_max_from(&[1, 2, 3, 4, 5]);
+        writer.commit(bytes);
+
+        let mut scratch = [0u8; 2];
+        let mut reader = cons.try_get_reader_grant().unwrap();
+        let bytes = reader.copy_max_into(&mut scratch);
+        assert_eq!(bytes, 2);
+        reader.consume(bytes);
+
+        assert_eq!(state.readable_bytes(), 3);
+    }
+
+    #[test]
+    fn readable_bytes_inverted_uses_wrapped_tail_and_head() {
+        let mut buffer = [0u8; 8];
+        let state = BufferState::new();
+        let (mut prod, mut cons) = state.init(buffer.as_mut()).unwrap();
+
+        // write=6, read=0
+        let mut writer = prod.try_get_writer_grant(NonZeroUsize::MAX).unwrap();
+        let bytes = writer.copy_max_from(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(bytes, 6);
+        writer.commit(bytes);
+
+        // write=6, read=4
+        let mut scratch = [0u8; 4];
+        let mut reader = cons.try_get_reader_grant().unwrap();
+        let bytes = reader.copy_max_into(&mut scratch);
+        assert_eq!(bytes, 4);
+        reader.consume(bytes);
+
+        // Forces wrap due to requested length not fitting at end.
+        let mut writer = prod.try_get_writer_grant(NonZeroUsize::new(3).unwrap()).unwrap();
+        let bytes = writer.copy_max_from(&[7, 8, 9]);
+        assert_eq!(bytes, 3);
+        writer.commit(bytes);
+
+        // Tail [4..6) => 2 bytes, head [0..3) => 3 bytes
+        assert_eq!(state.readable_bytes(), 5);
+    }
+
+    #[test]
+    fn readable_bytes_normalizes_reader_at_wrap_boundary() {
+        let mut buffer = [0u8; 8];
+        let state = BufferState::new();
+        let (mut prod, mut cons) = state.init(buffer.as_mut()).unwrap();
+
+        // Build inverted state with wrapped boundary: write=3, read=4, wrapped=6
+        let mut writer = prod.try_get_writer_grant(NonZeroUsize::MAX).unwrap();
+        let bytes = writer.copy_max_from(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(bytes, 6);
+        writer.commit(bytes);
+
+        let mut scratch = [0u8; 4];
+        let mut reader = cons.try_get_reader_grant().unwrap();
+        let bytes = reader.copy_max_into(&mut scratch);
+        assert_eq!(bytes, 4);
+        reader.consume(bytes);
+
+        let mut writer = prod.try_get_writer_grant(NonZeroUsize::new(3).unwrap()).unwrap();
+        let bytes = writer.copy_max_from(&[7, 8, 9]);
+        assert_eq!(bytes, 3);
+        writer.commit(bytes);
+
+        // Consume tail [4..6), so reader becomes wrapped boundary (6).
+        let mut scratch = [0u8; 2];
+        let mut reader = cons.try_get_reader_grant().unwrap();
+        let bytes = reader.copy_max_into(&mut scratch);
+        assert_eq!(bytes, 2);
+        reader.consume(bytes);
+
+        // Only wrapped head [0..3) remains readable.
+        assert_eq!(state.readable_bytes(), 3);
     }
 }
