@@ -35,3 +35,26 @@ impl<E> AtomicError<E> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basic_take_then_set() {
+        static ERROR: AtomicError<&'static str> = AtomicError::new();
+
+        assert_eq!(ERROR.take(), None);
+        
+        ERROR.set("The first");
+     
+        assert_eq!(ERROR.take(), Some("The first"));
+        assert_eq!(ERROR.take(), None);
+
+        ERROR.set("The forgotten");
+        ERROR.set("The finisher");
+
+        assert_eq!(ERROR.take(), Some("The finisher"));
+        assert_eq!(ERROR.take(), None);
+    }
+}
