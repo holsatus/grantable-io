@@ -45,9 +45,9 @@ mod tests {
         static ERROR: AtomicError<&'static str> = AtomicError::new();
 
         assert_eq!(ERROR.take(), None);
-        
+
         ERROR.set("The first");
-     
+
         assert_eq!(ERROR.take(), Some("The first"));
         assert_eq!(ERROR.take(), None);
 

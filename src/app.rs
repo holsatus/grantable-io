@@ -4,6 +4,7 @@ use super::State;
 use super::buffer::{BufferReader, BufferWriter, ReaderGrant};
 use crate::buffer::WriterGrant;
 
+/// The writer handle for a [`GrantableIo`](crate::GrantableIo)-backed serial stream.
 pub struct Writer<'a, E> {
     pub(super) writer: BufferWriter<'a>,
     pub(super) state: &'a State<E>,
@@ -54,7 +55,7 @@ impl<'a, E> Writer<'a, E> {
         Ok(bytes)
     }
 
-    pub async fn buf_mut(&mut self) -> Result<&mut [u8], E> {
+    pub async fn get_buf_mut(&mut self) -> Result<&mut [u8], E> {
         let grant = self.get_writer_grant(NonZeroUsize::MAX).await?;
         Ok(&mut *grant)
     }
@@ -99,6 +100,7 @@ impl<'a, E> Writer<'a, E> {
     }
 }
 
+/// The reader handle for a [`GrantableIo`](crate::GrantableIo)-backed serial stream.
 pub struct Reader<'a, E> {
     pub(super) reader: BufferReader<'a>,
     pub(super) state: &'a State<E>,

@@ -11,7 +11,7 @@ mod app;
 pub use app::{Reader, Writer};
 
 mod buffer;
-use buffer::{BufferReader, BufferState, BufferWriter};
+use buffer::{BufferReader, BufferWriter, AtomicState};
 
 mod error;
 use error::AtomicError;
@@ -19,7 +19,7 @@ use error::AtomicError;
 #[derive(Debug)]
 struct State<E> {
     pub(crate) error: AtomicError<E>,
-    pub(crate) state: BufferState,
+    pub(crate) state: AtomicState,
     pub(crate) wait_writer: WaitCell,
     pub(crate) wait_reader: WaitCell,
 }
@@ -28,7 +28,7 @@ impl<E> State<E> {
     const fn new() -> Self {
         Self {
             error: AtomicError::new(),
-            state: BufferState::new(),
+            state: AtomicState::new(),
             wait_writer: WaitCell::new(),
             wait_reader: WaitCell::new(),
         }
@@ -36,10 +36,11 @@ impl<E> State<E> {
 }
 
 /// A structure that owns the shared state and the buffer for serial communication.
+#[repr(C, align(4))]
 pub struct GrantableIo<const N: usize, E> {
-    state: State<E>,
     buffer: UnsafeCell<[u8; N]>,
     initialized: AtomicBool,
+    state: State<E>,
 }
 
 unsafe impl<const N: usize, E: Send> Send for GrantableIo<N, E> {}
@@ -50,9 +51,9 @@ impl<const N: usize, E> GrantableIo<N, E> {
     pub const fn new() -> Self {
         assert!(N > 0, "The value of `N` must be non-zero");
         Self {
-            state: State::new(),
             buffer: UnsafeCell::new([0; N]),
             initialized: AtomicBool::new(false),
+            state: State::new(),
         }
     }
 
