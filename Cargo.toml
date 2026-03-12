@@ -25,13 +25,8 @@ embedded-io-async-060 = {version = "0.6.0", package = "embedded-io-async", optio
 
 pin-project = "1.1.11"
 
-[target.'cfg(loom)'.dependencies]
-loom = { version = "0.7", default-features = false }
-
 [dev-dependencies]
 futures-executor = { version = "0.3.32", features = ["thread-pool"] }
+futures-util = { version = "0.3.32" }
 loom = "0.7.2"
 rand = "0.10.0"
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

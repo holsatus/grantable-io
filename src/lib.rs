@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), no_std)]
 
-use core::cell::UnsafeCell;
+use core::{cell::UnsafeCell, num::NonZeroUsize};
+
 use maitake_sync::WaitCell;
 use portable_atomic::AtomicBool;
 
@@ -11,7 +12,7 @@ mod app;
 pub use app::{Reader, Writer};
 
 mod buffer;
-use buffer::{BufferReader, BufferWriter, AtomicState};
+use buffer::{AtomicState, BufferReader, BufferWriter};
 
 mod error;
 use error::AtomicError;
@@ -117,6 +118,8 @@ impl<const N: usize, E> GrantableIo<N, E> {
         ))
     }
 }
+
+const BUF_LEN_GRACE: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
 #[cfg(feature = "embedded-io-async-070")]
 pub use embedded_io_async_070 as embedded_io_async;

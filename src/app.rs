@@ -55,18 +55,10 @@ impl<'a, E> Writer<'a, E> {
         Ok(bytes)
     }
 
-    pub async fn get_buf_mut(&mut self) -> Result<&mut [u8], E> {
-        let grant = self.get_writer_grant(NonZeroUsize::MAX).await?;
-        Ok(&mut *grant)
-    }
-
-    pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), E> {
-        let mut buf = buf;
+    pub async fn write_all(&mut self, mut buf: &[u8]) -> Result<(), E> {
         while !buf.is_empty() {
-            match self.write(buf).await {
-                Ok(n) => buf = &buf[n..],
-                Err(e) => return Err(e),
-            }
+            let n = self.write(buf).await?;
+            buf = &buf[n..];
         }
         Ok(())
     }
@@ -78,8 +70,12 @@ impl<'a, E> Writer<'a, E> {
         self.state.wait_reader.wake();
     }
 
+    pub async fn get_buf_mut(&mut self) -> Result<&mut [u8], E> {
+        let grant = self.get_writer_grant(crate::BUF_LEN_GRACE).await?;
+        Ok(&mut *grant)
+    }
+
     async fn get_writer_grant(&mut self, buf_len: NonZeroUsize) -> Result<&mut WriterGrant<'a>, E> {
-        // No need to check error before using pre-existing grant.
         if self.grant.is_some() {
             return Ok(self.grant.as_mut().unwrap());
         }
@@ -169,7 +165,6 @@ impl<'a, E> Reader<'a, E> {
     }
 
     async fn get_reader_grant(&mut self) -> Result<&mut ReaderGrant<'a>, E> {
-        // No need to check error before using pre-existing grant.
         if self.grant.is_some() {
             return Ok(self.grant.as_mut().unwrap());
         }
@@ -242,22 +237,54 @@ mod test {
 
         const BUF: &[u8] = b"_foo_bar_baz";
 
-        let serial_port = GrantableIo::<20, Infallible>::new();
-        let (mut hard, mut soft) = serial_port.claim_reader();
+        let gio = GrantableIo::<20, Infallible>::new();
+        let (mut w, mut r) = gio.claim_reader();
 
         futures_executor::block_on(async {
-            hard.write_all(BUF.as_ref()).await;
+            w.write_all(BUF.as_ref()).await;
 
             let mut buf = [0u8; 4];
 
-            assert_eq!(soft.read(buf.as_mut()).await.unwrap(), 4);
+            assert_eq!(r.read(buf.as_mut()).await.unwrap(), 4);
             assert_eq!(&buf, b"_foo");
 
-            assert_eq!(soft.read(buf.as_mut()).await.unwrap(), 4);
+            assert_eq!(r.read(buf.as_mut()).await.unwrap(), 4);
             assert_eq!(&buf, b"_bar");
 
-            assert_eq!(soft.read(buf.as_mut()).await.unwrap(), 4);
+            assert_eq!(r.read(buf.as_mut()).await.unwrap(), 4);
             assert_eq!(&buf, b"_baz");
+        })
+    }
+
+    #[test]
+    fn test_buf_write() {
+        use crate::GrantableIo;
+        use core::convert::Infallible;
+
+        const BUF: &[u8] = b"_foo_bar_baz";
+
+        let gio = GrantableIo::<20, Infallible>::new();
+        let (mut r, mut w) = gio.claim_writer();
+        
+        futures_executor::block_on(async {
+            let write_future = async {
+                w.write_all(&BUF).await.unwrap();
+            };
+            
+            let read_future = async {
+                let mut buf = [0u8; 4];
+
+                assert_eq!(r.read(buf.as_mut()).await, 4);
+                assert_eq!(&buf, b"_foo");
+
+                assert_eq!(r.read(buf.as_mut()).await, 4);
+                assert_eq!(&buf, b"_bar");
+
+                assert_eq!(r.read(buf.as_mut()).await, 4);
+                assert_eq!(&buf, b"_baz");
+            };
+
+            futures_util::join!(write_future, read_future);
         })
     }
 }

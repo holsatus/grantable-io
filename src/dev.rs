@@ -26,15 +26,14 @@ impl<'a, E> DeviceWriter<'a, E> {
         let mut grant = self.get_writer_grant(buf_len).await;
         let bytes = grant.copy_max_from(buf);
         grant.commit(bytes);
-        self.wake_reader();
+        self.state.wait_reader.wake();
         bytes
     }
 
     /// Write all bytes from the provided buffer into the stream.
     ///
     /// Note: This wakes the reader automatically, so no need to call `wake_reader`
-    pub async fn write_all(&mut self, buf: &[u8]) {
-        let mut buf = buf;
+    pub async fn write_all(&mut self, mut buf: &[u8]) {
         while !buf.is_empty() {
             let bytes = self.write(buf).await;
             buf = &buf[bytes..];
@@ -61,10 +60,6 @@ impl<'a, E> DeviceWriter<'a, E> {
         }
     }
 
-    pub fn wake_reader(&mut self) {
-        self.state.wait_reader.wake();
-    }
-
     /// Connect this writer to another [`embedded_io_async::Read`], such that
     /// all bytes received through `reader` will be copied to this writers buffer.
     ///
@@ -77,16 +72,15 @@ impl<'a, E> DeviceWriter<'a, E> {
         map_err: impl Fn(R::Error) -> E,
     ) {
         loop {
-            const BUF_LEN_GRACE: NonZeroUsize = NonZeroUsize::new(32).unwrap();
-            let mut grant = self.get_writer_grant(BUF_LEN_GRACE).await;
+            let mut grant = self.get_writer_grant(crate::BUF_LEN_GRACE).await;
             match reader.read(&mut grant).await {
                 Ok(0) => break,
                 Ok(bytes) => {
                     grant.commit(bytes);
-                    self.wake_reader();
+                    self.state.wait_reader.wake();
                 }
                 Err(error) => {
-                    grant.commit(0);
+                    core::mem::drop(grant);
                     self.insert_error(map_err(error));
                 }
             }
@@ -105,17 +99,17 @@ impl<'a, E> DeviceReader<'a, E> {
         let mut grant = self.get_reader_grant().await;
         let bytes = grant.copy_max_into(buf);
         grant.consume(bytes);
-        self.wake_writer();
+        self.state.wait_writer.wake();
         bytes
     }
 
     pub fn insert_error(&mut self, error: E) {
         self.state.error.set(error);
-        self.wake_writer();
+        self.state.wait_writer.wake();
     }
 
     /// Get a grant to read from
-    pub async fn get_reader_grant(&mut self) -> ReaderGrant<'a> {
+    pub async fn get_reader_grant(&mut self) -> ReaderGrant<'_> {
         loop {
             let subscriber = self.state.wait_reader.subscribe().await;
 
@@ -125,11 +119,6 @@ impl<'a, E> DeviceReader<'a, E> {
 
             _ = subscriber.await;
         }
-    }
-
-    /// Wake the writing end to notify it that
-    pub fn wake_writer(&mut self) {
-        self.state.wait_writer.wake();
     }
 
     /// Connect this reader to another [`embedded_io_async::Write`], such that
@@ -158,10 +147,10 @@ impl<'a, E> DeviceReader<'a, E> {
                 Ok(0) => break,
                 Ok(bytes) => {
                     grant.consume(bytes);
-                    self.wake_writer();
+                    self.state.wait_writer.wake();
                 }
                 Err(error) => {
-                    grant.consume(0);
+                    core::mem::drop(grant);
                     self.insert_error(map_err(error));
                 }
             }
