@@ -168,7 +168,10 @@ impl<'a> BufferWriter<'a> {
             (c.writer, c.reader.saturating_sub(c.writer))
         };
 
-        debug_assert!(start + grant_len <= self.buffer.len());
+        debug_assert!(
+            start + grant_len <= self.buffer.len(),
+            "The granted region was out of bounds!"
+        );
 
         // Return if we were not granted anything
         if grant_len == 0 {
@@ -241,7 +244,10 @@ impl<'a> BufferReader<'a> {
             (0, c.writer)
         };
 
-        debug_assert!(start + grant_len <= self.buffer.len());
+        debug_assert!(
+            start + grant_len <= self.buffer.len(),
+            "The granted region was out of bounds!"
+        );
 
         if grant_len == 0 {
             return None;
