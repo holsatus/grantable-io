@@ -120,22 +120,12 @@ impl<'a, E> DeviceReader<'a, E> {
             _ = subscriber.await;
         }
     }
-
     /// Connect this reader to another [`embedded_io_async::Write`], such that
     /// all bytes received through this reader will be written to `writer`.
     ///
     /// This will loop forever, *or* until the `writer` reaches an EOF condition.
     #[cfg(feature = "_any_embedded_io_async")]
-    pub async fn embedded_io_connect<W: Write<Error = E>>(&mut self, writer: W) {
-        self.embedded_io_connect_mapped(writer, |error| error).await
-    }
-
-    /// Connect this reader to another [`embedded_io_async::Write`], such that
-    /// all bytes received through this reader will be written to `writer`.
-    ///
-    /// This will loop forever, *or* until the `writer` reaches an EOF condition.
-    #[cfg(feature = "_any_embedded_io_async")]
-    pub async fn embedded_io_connect_mapped<W: Write>(
+    pub async fn embedded_io_connect<W: Write>(
         &mut self,
         mut writer: W,
         map_err: impl Fn(W::Error) -> E,
