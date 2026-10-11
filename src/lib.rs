@@ -1,7 +1,18 @@
 #![cfg_attr(not(test), no_std)]
 
+// At most one `embedded-io-async` line may be selected at a time. Emit a clear
+// error rather than letting Cargo fail with "depends on ... multiple times".
+#[cfg(all(feature = "embedded-io-async-07", feature = "embedded-io-async-06"))]
+compile_error!(
+    "features `embedded-io-async-07` and `embedded-io-async-06` are mutually \
+     exclusive; enable exactly one"
+);
+
 use core::{cell::UnsafeCell, num::NonZeroUsize};
 
+mod loom;
+
+use loom::loom_const_fn;
 use maitake_sync::WaitCell;
 use portable_atomic::AtomicBool;
 
@@ -26,12 +37,14 @@ struct State<E> {
 }
 
 impl<E> State<E> {
-    const fn new() -> Self {
-        Self {
-            error: AtomicError::new(),
-            state: AtomicState::new(),
-            wait_writer: WaitCell::new(),
-            wait_reader: WaitCell::new(),
+    loom_const_fn! {
+        const fn new() -> Self {
+            Self {
+                error: AtomicError::new(),
+                state: AtomicState::new(),
+                wait_writer: WaitCell::new(),
+                wait_reader: WaitCell::new(),
+            }
         }
     }
 }
@@ -48,13 +61,15 @@ unsafe impl<const N: usize, E: Send> Send for GrantableIo<N, E> {}
 unsafe impl<const N: usize, E: Send> Sync for GrantableIo<N, E> {}
 
 impl<const N: usize, E> GrantableIo<N, E> {
-    /// Creates a new, uninitialized SerialPort.
-    pub const fn new() -> Self {
-        assert!(N > 0, "The value of `N` must be non-zero");
-        Self {
-            buffer: UnsafeCell::new([0; N]),
-            initialized: AtomicBool::new(false),
-            state: State::new(),
+    loom_const_fn! {
+        /// Creates a new, uninitialized GrantableIo.
+        pub const fn new() -> Self {
+            assert!(N > 0, "The value of `N` must be non-zero");
+            Self {
+                buffer: UnsafeCell::new([0; N]),
+                initialized: AtomicBool::new(false),
+                state: State::new(),
+            }
         }
     }
 
@@ -119,13 +134,11 @@ impl<const N: usize, E> GrantableIo<N, E> {
     }
 }
 
+/// Wrap-around threshold for writer grants, as a number of bytes.
 const BUF_LEN_GRACE: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
-#[cfg(feature = "embedded-io-async-070")]
-pub use embedded_io_async_070 as embedded_io_async;
+#[cfg(feature = "embedded-io-async-07")]
+pub use embedded_io_async_07 as embedded_io_async;
 
-#[cfg(feature = "embedded-io-async-061")]
-pub use embedded_io_async_061 as embedded_io_async;
-
-#[cfg(feature = "embedded-io-async-060")]
-pub use embedded_io_async_060 as embedded_io_async;
+#[cfg(feature = "embedded-io-async-06")]
+pub use embedded_io_async_06 as embedded_io_async;

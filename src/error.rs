@@ -1,8 +1,11 @@
 use core::sync::atomic::Ordering;
 
+use crate::loom::loom_const_fn;
 use maitake_sync::blocking::Mutex;
 use portable_atomic::AtomicBool;
 
+/// A single-slot, latest-wins error channel shared between the device and
+/// application halves of one buffer.
 #[derive(Debug)]
 pub(crate) struct AtomicError<E> {
     has_error: AtomicBool,
@@ -10,10 +13,12 @@ pub(crate) struct AtomicError<E> {
 }
 
 impl<E> AtomicError<E> {
-    pub(crate) const fn new() -> Self {
-        AtomicError {
-            has_error: AtomicBool::new(false),
-            error: Mutex::new(None),
+    loom_const_fn! {
+        pub(crate) const fn new() -> Self {
+            AtomicError {
+                has_error: AtomicBool::new(false),
+                error: Mutex::new(None),
+            }
         }
     }
 
@@ -36,7 +41,7 @@ impl<E> AtomicError<E> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 

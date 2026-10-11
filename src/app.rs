@@ -70,6 +70,10 @@ impl<'a, E> Writer<'a, E> {
         self.state.wait_reader.wake();
     }
 
+    /// Wait for a contiguous writable region of the buffer (at least one byte).
+    ///
+    /// Bytes written into the slice only become visible to the reader
+    /// after a subsequent [`Writer::commit`] with the number of bytes written.
     pub async fn get_buf_mut(&mut self) -> Result<&mut [u8], E> {
         let grant = self.get_writer_grant(crate::BUF_LEN_GRACE).await?;
         Ok(&mut *grant)
@@ -228,6 +232,7 @@ mod impl_embedded_io_async {
     }
 }
 
+#[cfg(not(loom))]
 mod test {
 
     #[test]
@@ -265,12 +270,12 @@ mod test {
 
         let gio = GrantableIo::<20, Infallible>::new();
         let (mut r, mut w) = gio.claim_writer();
-        
+
         futures_executor::block_on(async {
             let write_future = async {
                 w.write_all(&BUF).await.unwrap();
             };
-            
+
             let read_future = async {
                 let mut buf = [0u8; 4];
 

@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Unit + integration tests, once per `embedded-io-async` line. The lines are
+  # mutually exclusive features, so they cannot be tested together.
+  test:
+    name: test (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features"
+          - "--no-default-features --features embedded-io-async-07"
+          - "--no-default-features --features embedded-io-async-06"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test ${{ matrix.features }}
+
+  # The threaded producer/consumer stress test is timing dependent; run it in
+  # release, single threaded, where it reliably exercises any wrap races.
+  stress:
+    name: concurrency stress (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release --test concurrency -- --test-threads=1
+
+  # Miri checks the `unsafe` buffer aliasing and detects data races in the
+  # end-to-end concurrent test. `spsc_roundtrip` is sized down under `cfg(miri)`.
+  miri:
+    name: miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Miri (stacked borrows + strict provenance)
+        run: cargo miri test
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+      - name: Miri (tree borrows + strict provenance, multiple schedules)
+        run: cargo miri test
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-strict-provenance -Zmiri-many-seeds=0..8
+
+  # Loom exhaustively explores thread interleavings of the two buffer halves.
+  # This is the deterministic regression test for the `wrapped` lost update.
+  loom:
+    name: loom
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --lib -- --test-threads=1
+        env:
+          RUSTFLAGS: --cfg loom
+          LOOM_MAX_PREEMPTIONS: "3"
+
+  # Ensure the crate still builds for a real `no_std` target without atomic CAS
+  # (thumbv6m needs `critical-section`).
+  embedded:
+    name: no_std target build (thumbv6m)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv6m-none-eabi
+      - run: cargo build --target thumbv6m-none-eabi --features critical-section

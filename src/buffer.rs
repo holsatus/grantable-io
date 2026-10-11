@@ -7,7 +7,8 @@ use core::{
     sync::atomic::Ordering::{Acquire, Release},
 };
 
-use portable_atomic::{AtomicBool, AtomicUsize};
+use crate::loom::loom_const_fn;
+use crate::loom::sync::atomic::{AtomicBool, AtomicUsize};
 
 #[derive(Debug)]
 /// An atomic coordination structure for safely granting
@@ -15,6 +16,23 @@ use portable_atomic::{AtomicBool, AtomicUsize};
 pub struct AtomicState {
     /// Whether this instance has been initialized
     initialized: AtomicBool,
+
+    /// Cursor marking where the writer last wrapped around; `0` means "not wrapped".
+    ///
+    /// This cursor is written by *both* halves, so its ownership rules are strict.
+    /// A half may only write to `wrapped` while its captured snapshot says it owns it.
+    ///
+    /// - `Owned by the writer-half iff. wrapped == 0`
+    ///     - readable is `[reader, writer)`; free is `[writer, N)` and `[0, reader)`.
+    /// - Owned by the reader-half iff. `wrapped != 0`:
+    ///     - readable is `[reader, wrapped)` and `[0, writer)` free is `[writer, reader)`.
+    ///
+    ///
+    /// Ordering: [`AtomicState::cursors`] loads `wrapped` **first**, and every
+    /// handoff publishes its primary cursor (`reader`/`writer`) before `wrapped`
+    /// (all `Release`/`Acquire`), so observing a new `wrapped` implies observing
+    /// the cursor published with it.
+    wrapped: AtomicUsize,
 
     /// Where the next byte will be written
     ///
@@ -25,12 +43,6 @@ pub struct AtomicState {
     ///
     /// - Owned by the reader-half
     reader: AtomicUsize,
-
-    /// Where the writer has wrapped around if != 0
-    ///
-    /// - Owned by writer-half if `wrapped == 0`
-    /// - Owned by reader-half if `wrapped != 0`
-    wrapped: AtomicUsize,
 
     /// Is there an active read grant?
     read_granted: AtomicBool,
@@ -53,15 +65,17 @@ struct Cursors {
 }
 
 impl AtomicState {
-    /// Create a new instance of an [`BufferState`].
-    pub const fn new() -> Self {
-        Self {
-            initialized: AtomicBool::new(false),
-            writer: AtomicUsize::new(0),
-            reader: AtomicUsize::new(0),
-            wrapped: AtomicUsize::new(0),
-            read_granted: AtomicBool::new(false),
-            write_granted: AtomicBool::new(false),
+    loom_const_fn! {
+        /// Create a new instance of an [`AtomicState`].
+        pub const fn new() -> Self {
+            Self {
+                initialized: AtomicBool::new(false),
+                writer: AtomicUsize::new(0),
+                reader: AtomicUsize::new(0),
+                wrapped: AtomicUsize::new(0),
+                read_granted: AtomicBool::new(false),
+                write_granted: AtomicBool::new(false),
+            }
         }
     }
 
@@ -76,30 +90,30 @@ impl AtomicState {
         }
     }
 
-    /// Get the number of writeable bytes in the buffer of length `len`.
-    ///
-    /// Not all bytes may not be contiguous
+    /// Get an estimate of the number of writeable bytes in a buffer of length
+    /// `len`. The writeable bytes are not necessarily contiguous.
     pub fn writable_bytes(&self, len: usize) -> usize {
         let c = self.cursors();
 
-        if c.wrapped == 0 {
+        let bytes = if c.wrapped == 0 {
             len.saturating_sub(c.writer) + c.reader
         } else {
             c.reader.saturating_sub(c.writer)
-        }
+        };
+        bytes.min(len)
     }
 
-    /// Get the number of readable bytes in the buffer.
-    ///
-    /// Not all bytes may not be contiguous
-    pub fn readable_bytes(&self) -> usize {
+    /// Get an estimate of the number of readable bytes in a buffer of length
+    /// `len`. The readable bytes are not necessarily contiguous.
+    pub fn readable_bytes(&self, len: usize) -> usize {
         let c = self.cursors();
 
-        if c.wrapped == 0 {
+        let bytes = if c.wrapped == 0 {
             c.writer.saturating_sub(c.reader)
         } else {
             c.wrapped.saturating_sub(c.reader) + c.writer
-        }
+        };
+        bytes.min(len)
     }
 
     /// Attempt to initialize the [`BufferState`] into [`BufferWriter`] and [`BufferReader`]
@@ -132,6 +146,10 @@ pub struct BufferWriter<'a> {
     state: &'a AtomicState,
 }
 
+// SAFETY: `BufferWriter` holds a raw pointer into the shared buffer plus a
+// shared reference to `AtomicState`. It is the unique owner of the writer half
+// (it is created once and never aliased), and its grants only ever cover free
+// space, so moving it to another thread is sound.
 unsafe impl Send for BufferWriter<'_> {}
 
 impl<'a> BufferWriter<'a> {
@@ -140,7 +158,7 @@ impl<'a> BufferWriter<'a> {
     }
 
     pub fn readable_bytes(&self) -> usize {
-        self.state.readable_bytes()
+        self.state.readable_bytes(self.buffer.len())
     }
 
     /// Request a writable contiguous section of memory of at least 1 byte.
@@ -160,6 +178,8 @@ impl<'a> BufferWriter<'a> {
             // Wrap around if space at start is
             // larger and the buffer will not fit at end
             if space_at_start > space_at_end && buf_len.get() > space_at_end {
+                // A wrap is only possible once the buffer is non-empty.
+                debug_assert!(c.writer > 0, "wrap-around selected with writer == 0");
                 (0, space_at_start)
             } else {
                 (c.writer, space_at_end)
@@ -196,7 +216,6 @@ impl<'a> BufferWriter<'a> {
             at_start: start == 0,
             _p: PhantomData,
         })
-
     }
 
     #[cfg(test)]
@@ -216,6 +235,10 @@ pub struct BufferReader<'a> {
     state: &'a AtomicState,
 }
 
+// SAFETY: `BufferReader` holds a raw pointer into the shared buffer plus a
+// shared reference to `AtomicState`. It is the unique owner of the writer half
+// (it is created once and never aliased), and its grants only ever cover free
+// space, so moving it to another thread is sound.
 unsafe impl Send for BufferReader<'_> {}
 
 impl<'a> BufferReader<'a> {
@@ -224,7 +247,7 @@ impl<'a> BufferReader<'a> {
     }
 
     pub fn readable_bytes(&self) -> usize {
-        self.state.readable_bytes()
+        self.state.readable_bytes(self.buffer.len())
     }
 
     /// Obtains a contiguous slice of committed bytes. This slice may not
@@ -292,6 +315,9 @@ pub struct WriterGrant<'a> {
     _p: PhantomData<&'a mut [u8]>,
 }
 
+// SAFETY: a grant is a raw pointer to a freshly-derived unique slice over the
+// granted region plus a state reference. At most one writer grant exists at a
+// time (enforced by `write_granted`), so moving it to another thread is sound.
 unsafe impl Send for WriterGrant<'_> {}
 
 impl WriterGrant<'_> {
@@ -362,6 +388,9 @@ pub struct ReaderGrant<'a> {
     _p: PhantomData<&'a mut [u8]>,
 }
 
+// SAFETY: a grant is a raw pointer to a freshly-derived unique slice over the
+// granted region plus a state reference. At most one writer grant exists at a
+// time (enforced by `read_granted`), so moving it to another thread is sound.
 unsafe impl Send for ReaderGrant<'_> {}
 
 impl ReaderGrant<'_> {
@@ -395,7 +424,9 @@ impl ReaderGrant<'_> {
         if self.reader == self.wrapped {
             // Consuming from start segment
             s.reader.store(used, Release);
-            s.wrapped.store(0, Release);
+            if self.wrapped != 0 {
+                s.wrapped.store(0, Release);
+            }
         } else {
             // Non-wrapped progress
             let next_reader = self.reader + used;
@@ -431,7 +462,7 @@ impl DerefMut for ReaderGrant<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::{AtomicState, Cursors};
 
@@ -478,31 +509,117 @@ mod tests {
 
         // Nothing to read initially
         assert!(r.try_get_reader_grant().is_none());
-        assert_eq!(state.cursors(), Cursors { wrapped: 0, writer: 0, reader: 0 });
+        assert_eq!(
+            state.cursors(),
+            Cursors {
+                wrapped: 0,
+                writer: 0,
+                reader: 0
+            }
+        );
 
         let payload = b"abcdefgh";
         let mut read_buf = [0u8; 16];
 
         // Write to the buffer
         w.try_write(payload).unwrap();
-        assert_eq!(state.cursors(), Cursors { wrapped: 0, writer: 8, reader: 0 });
-        
+        assert_eq!(
+            state.cursors(),
+            Cursors {
+                wrapped: 0,
+                writer: 8,
+                reader: 0
+            }
+        );
+
         // Read from the buffer
         let bytes = r.try_read(&mut read_buf).unwrap();
-        assert_eq!(state.cursors(), Cursors { wrapped: 0, writer: 8, reader: 8 });
+        assert_eq!(
+            state.cursors(),
+            Cursors {
+                wrapped: 0,
+                writer: 8,
+                reader: 8
+            }
+        );
         assert_eq!(&read_buf[..bytes], payload);
 
         // Write to the buffer (again)
         w.try_write(payload).unwrap();
-        assert_eq!(state.cursors(), Cursors { wrapped: 8, writer: 8, reader: 8 });
+        assert_eq!(
+            state.cursors(),
+            Cursors {
+                wrapped: 8,
+                writer: 8,
+                reader: 8
+            }
+        );
 
         // Read from the buffer
         let bytes = r.try_read(&mut read_buf).unwrap();
-        assert_eq!(state.cursors(), Cursors { wrapped: 0, writer: 8, reader: 8 });
+        assert_eq!(
+            state.cursors(),
+            Cursors {
+                wrapped: 0,
+                writer: 8,
+                reader: 8
+            }
+        );
         assert_eq!(&read_buf[..bytes], payload);
 
         // Nothing to read after
         assert!(r.try_get_reader_grant().is_none());
+    }
+
+    #[test]
+    fn readable_bytes_is_a_lower_bound() {
+        // Force a wrapped layout so readable spans both segments, then verify
+        // that `readable_bytes()` bytes can all be read without a zero-length
+        // read (i.e. without the writer having to produce more).
+        let mut buffer = [0u8; 10];
+        let state = AtomicState::new();
+        let (mut w, mut r) = state.init(buffer.as_mut()).unwrap();
+
+        w.try_write(&[b'a'; 8]).unwrap();
+        let mut sink = [0u8; 6];
+        assert_eq!(r.try_read(&mut sink).unwrap(), 6);
+
+        w.try_write(&[b'b'; 2]).unwrap(); // fill tail -> writer = 10
+        w.try_write(&[b'c'; 6]).unwrap(); // wrap -> writer = 6, wrapped = 10
+
+        let n = r.readable_bytes();
+        assert_eq!(n, 10);
+
+        let mut got = 0;
+        let mut out = [0u8; 10];
+        while got < n {
+            let k = r.try_read(&mut out[got..]).unwrap();
+            assert!(k > 0, "reader could not read {n} guaranteed bytes");
+            got += k;
+        }
+        assert_eq!(got, n);
+    }
+
+    #[test]
+    fn writable_bytes_is_total_free_space() {
+        // `writable_bytes` counts the total free space across both segments.
+        // A single large request can wrap early and strand the tail, so it must
+        // be claimed segment-by-segment to realize the whole amount.
+        let mut buffer = [0u8; 10];
+        let state = AtomicState::new();
+        let (mut w, mut r) = state.init(buffer.as_mut()).unwrap();
+
+        w.try_write(&[0u8; 8]).unwrap();
+        let mut sink = [0u8; 6];
+        assert_eq!(r.try_read(&mut sink).unwrap(), 6);
+
+        // writer = 8, reader = 6 -> free = [8,10) + [0,6) = 8
+        assert_eq!(w.writable_bytes(), 8);
+
+        // Tail first, then the wrap into the start segment: all 8 bytes.
+        assert_eq!(w.try_write(&[0u8; 2]).unwrap(), 2);
+        assert_eq!(w.try_write(&[0u8; 6]).unwrap(), 6);
+        assert_eq!(w.writable_bytes(), 0);
     }
 
     #[test]
@@ -514,29 +631,191 @@ mod tests {
         let mut read_buf = [0u8; 16];
 
         assert!(r.try_get_reader_grant().is_none());
-        assert_eq!(state.cursors(), Cursors { wrapped: 0, writer: 0, reader: 0 });
+        assert_eq!(
+            state.cursors(),
+            Cursors {
+                wrapped: 0,
+                writer: 0,
+                reader: 0
+            }
+        );
 
         // Write to the buffer
         let payload = b"abcdef";
         w.try_write(payload).unwrap();
-        assert_eq!(state.cursors(), Cursors { wrapped: 0, writer: 6, reader: 0 });
-        
+        assert_eq!(
+            state.cursors(),
+            Cursors {
+                wrapped: 0,
+                writer: 6,
+                reader: 0
+            }
+        );
+
         // Read from the buffer
         let bytes = r.try_read(&mut read_buf).unwrap();
-        assert_eq!(state.cursors(), Cursors { wrapped: 0, writer: 6, reader: 6 });
+        assert_eq!(
+            state.cursors(),
+            Cursors {
+                wrapped: 0,
+                writer: 6,
+                reader: 6
+            }
+        );
         assert_eq!(&read_buf[..bytes], payload);
 
         // Write to the buffer
         let payload = b"abcd";
         w.try_write(payload).unwrap();
-        assert_eq!(state.cursors(), Cursors { wrapped: 6, writer: 4, reader: 6 });
+        assert_eq!(
+            state.cursors(),
+            Cursors {
+                wrapped: 6,
+                writer: 4,
+                reader: 6
+            }
+        );
 
         // Read from the buffer
         let bytes = r.try_read(&mut read_buf).unwrap();
-        assert_eq!(state.cursors(), Cursors { wrapped: 0, writer: 4, reader: 4 });
+        assert_eq!(
+            state.cursors(),
+            Cursors {
+                wrapped: 0,
+                writer: 4,
+                reader: 4
+            }
+        );
         assert_eq!(&read_buf[..bytes], payload);
 
         // Nothing to read after
         assert!(r.try_get_reader_grant().is_none());
+    }
+}
+
+/// Loom model tests.
+///
+/// Run with:
+///
+/// ```text
+/// RUSTFLAGS="--cfg loom" cargo test --lib -- --test-threads=1
+/// ```
+///
+/// Under `--cfg loom`, `AtomicState` uses Loom's instrumented atomics, so Loom
+/// exhaustively explores the thread interleavings of the two halves within the
+/// configured bounds. These are the authoritative, deterministic regression
+/// tests for the `wrapped` ownership contract.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::AtomicState;
+    use crate::loom::{model, thread};
+    use core::num::NonZeroUsize;
+
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).unwrap()
+    }
+
+    /// Regression test for a previously observed lost `wrapped` update.
+    ///
+    /// Before the guard in [`super::ReaderGrant::consume`], the reader cleared
+    /// `wrapped` even when it had captured `wrapped == 0`, racing with a
+    /// concurrent writer wrap. The two halves then disagree about how many bytes
+    /// are readable; the writer can overwrite bytes the reader has not yet seen
+    /// and the inconsistent cursor state can deadlock both halves.
+    ///
+    /// The invariant checked is exact: the cursor state's own
+    /// [`AtomicState::readable_bytes`] must equal the bytes committed minus the
+    /// bytes consumed, tracked independently by each thread.
+    #[test]
+    fn wrapped_not_clobbered_by_reader_consume() {
+        model(|| {
+            const N: usize = 1;
+
+            // Tests may leak: Loom re-runs this closure per schedule and we need
+            // `'static` borrows for `loom::thread::spawn`.
+            let state: &'static AtomicState = Box::leak(Box::new(AtomicState::new()));
+            let buf: &'static mut [u8] = Box::leak(vec![0u8; N].into_boxed_slice());
+            let (mut writer, mut reader) = state.init(buf).unwrap();
+
+            let wt = thread::spawn(move || {
+                let mut produced = 0usize;
+                // A wrap only becomes possible after the reader has drained, so
+                // retry a bounded number of times to let Loom interleave.
+                for _ in 0..4 {
+                    if let Some(mut grant) = writer.try_get_writer_grant(nz(1)) {
+                        let n = grant.copy_max_from(&[0xAB]);
+                        grant.commit(n);
+                        produced += n;
+                    }
+                }
+                produced
+            });
+
+            let rt = thread::spawn(move || {
+                let mut consumed = 0usize;
+                for _ in 0..4 {
+                    if let Some(mut grant) = reader.try_get_reader_grant() {
+                        let mut scratch = [0u8; N];
+                        let n = grant.copy_max_into(&mut scratch);
+                        grant.consume(n);
+                        consumed += n;
+                    }
+                }
+                consumed
+            });
+
+            let produced = wt.join().unwrap();
+            let consumed = rt.join().unwrap();
+
+            assert_eq!(
+                state.readable_bytes(N),
+                produced - consumed,
+                "cursor state disagrees with committed-minus-consumed bytes \
+                 (lost update on `wrapped`)"
+            );
+        });
+    }
+
+    /// Same invariant, but with a slightly larger buffer and multi-byte grants
+    /// so more wrap sequences are explored.
+    #[test]
+    fn wrapped_invariant_holds_under_wrap_churn() {
+        model(|| {
+            const N: usize = 3;
+
+            let state: &'static AtomicState = Box::leak(Box::new(AtomicState::new()));
+            let buf: &'static mut [u8] = Box::leak(vec![0u8; N].into_boxed_slice());
+            let (mut writer, mut reader) = state.init(buf).unwrap();
+
+            let wt = thread::spawn(move || {
+                let mut produced = 0usize;
+                for _ in 0..5 {
+                    if let Some(mut grant) = writer.try_get_writer_grant(nz(2)) {
+                        let n = grant.copy_max_from(&[1, 2]);
+                        grant.commit(n);
+                        produced += n;
+                    }
+                }
+                produced
+            });
+
+            let rt = thread::spawn(move || {
+                let mut consumed = 0usize;
+                for _ in 0..5 {
+                    if let Some(mut grant) = reader.try_get_reader_grant() {
+                        let mut scratch = [0u8; N];
+                        let n = grant.copy_max_into(&mut scratch);
+                        grant.consume(n);
+                        consumed += n;
+                    }
+                }
+                consumed
+            });
+
+            let produced = wt.join().unwrap();
+            let consumed = rt.join().unwrap();
+
+            assert_eq!(state.readable_bytes(N), produced - consumed);
+        });
     }
 }

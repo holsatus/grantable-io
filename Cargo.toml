@@ -2,13 +2,13 @@
 name = "grantable-io"
 version = "0.3.0"
 edition = "2024"
+rust-version = "1.85"
 
 [features]
-default = ["embedded-io-async-070"]
+default = ["embedded-io-async-07"]
 
-embedded-io-async-070 = ["dep:embedded-io-async-070", "_any_embedded_io_async"]
-embedded-io-async-061 = ["dep:embedded-io-async-061", "_any_embedded_io_async"]
-embedded-io-async-060 = ["dep:embedded-io-async-060", "_any_embedded_io_async"]
+embedded-io-async-07 = ["dep:embedded-io-async-07", "_any_embedded_io_async"]
+embedded-io-async-06 = ["dep:embedded-io-async-06", "_any_embedded_io_async"]
 
 _any_embedded_io_async = []
 
@@ -19,14 +19,18 @@ critical-section = ["portable-atomic/critical-section", "maitake-sync/critical-s
 portable-atomic = "1.13.1"
 maitake-sync = { version = "0.2.2", default-features = false, features = ["no-cache-pad"] }
 
-embedded-io-async-070 = {version = "0.7.0", package = "embedded-io-async", optional = true }
-embedded-io-async-061 = {version = "0.6.1", package = "embedded-io-async", optional = true }
-embedded-io-async-060 = {version = "0.6.0", package = "embedded-io-async", optional = true }
-
-pin-project = "1.1.11"
+embedded-io-async-07 = { version = "0.7", package = "embedded-io-async", optional = true }
+embedded-io-async-06 = { version = "0.6.1", package = "embedded-io-async", optional = true }
 
 [dev-dependencies]
 futures-executor = { version = "0.3.32", features = ["thread-pool"] }
 futures-util = { version = "0.3.32" }
 loom = "0.7.2"
-rand = "0.10.0"
+
+# `--cfg loom` switches the crate onto Loom's instrumented atomics/threads.
+# See `src/loom.rs`; run `RUSTFLAGS="--cfg loom" cargo test --lib`.
+[target.'cfg(loom)'.dependencies]
+loom = { version = "0.7", default-features = false }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

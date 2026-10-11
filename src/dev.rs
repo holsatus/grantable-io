@@ -61,10 +61,16 @@ impl<'a, E> DeviceWriter<'a, E> {
     }
 
     /// Connect this writer to another [`embedded_io_async::Read`], such that
-    /// all bytes received through `reader` will be copied to this writers buffer.
+    /// all bytes received through `reader` will be copied to this writer's
+    /// buffer.
     ///
-    /// This will loop forever, or until the reader reaches an EOF conditions,
-    /// represented by a 0 byte read.
+    /// This loops until the reader signals EOF (a 0-byte read).
+    ///
+    /// **Errors do not terminate the loop.** On error the error is published via
+    /// [`DeviceWriter::insert_error`] (waking the app side) and reading
+    /// continues. If the underlying reader keeps failing, this will keep
+    /// publishing errors and retrying rather than unwinding the task; callers
+    /// that want to stop on a device fault must arrange that themselves.
     #[cfg(feature = "_any_embedded_io_async")]
     pub async fn embedded_io_connect<R: Read>(
         &mut self,
@@ -123,7 +129,12 @@ impl<'a, E> DeviceReader<'a, E> {
     /// Connect this reader to another [`embedded_io_async::Write`], such that
     /// all bytes received through this reader will be written to `writer`.
     ///
-    /// This will loop forever, *or* until the `writer` reaches an EOF condition.
+    /// This loops until `writer` signals it can accept no more (a 0-byte write).
+    ///
+    /// **Errors do not terminate the loop.** On error the error is published via
+    /// [`DeviceReader::insert_error`] (waking the app side) and the loop
+    /// continues; callers that want to stop on a device fault must arrange that
+    /// themselves.
     #[cfg(feature = "_any_embedded_io_async")]
     pub async fn embedded_io_connect<W: Write>(
         &mut self,
